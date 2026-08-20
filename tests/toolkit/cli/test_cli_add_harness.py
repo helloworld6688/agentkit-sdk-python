@@ -218,6 +218,37 @@ def test_registry_flags_write_agentkit_a2a_section(tmp_path):
     assert data["include_tools_every_turn"] is True
 
 
+def test_registry_uri_writes_uni_registry_section(tmp_path):
+    result = _run(
+        [
+            "harness",
+            "--name",
+            "h",
+            "--registry",
+            (
+                "uni-registry://reg-test?"
+                "endpoint=https%3A%2F%2Fregistry.example&record_type=agent_card&top_k=5"
+            ),
+            "--directory",
+            str(tmp_path),
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads((tmp_path / "h.harness.json").read_text())
+    assert data["registry"] == {
+        "type": "uni_registry",
+        "id": "reg-test",
+        "endpoint": "https://registry.example",
+        "record_type": "agent_card",
+        "top_k": 5,
+    }
+    env = to_runtime_env(data)
+    assert env["REGISTRY_TYPE"] == "uni_registry"
+    assert env["REGISTRY_ID"] == "reg-test"
+    assert env["REGISTRY_RECORD_TYPE"] == "agent_card"
+
+
 def test_registry_add_enables_a2a_space_intent(tmp_path, monkeypatch):
     calls = []
 

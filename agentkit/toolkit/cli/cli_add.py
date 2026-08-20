@@ -66,8 +66,10 @@ _SHORT_TERM_MEMORY_TYPES = ("local", "sqlite", "mysql", "postgresql")
 # Harness name charset (matches `init`'s directory-name rule).
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _REGISTRY_QUERY_KEYS = {
+    "id",
     "space_id",
     "space_name",
+    "record_type",
     "top_k",
     "endpoint",
     "region",
@@ -166,21 +168,29 @@ def _expand_default_registry_uri(value: str) -> str:
 
 
 def _parse_registry_uri(value: str) -> dict:
-    """Parse the supported AgentKit A2A registry URI into a spec section."""
+    """Parse a supported A2A registry URI into a Harness spec section."""
     raw = _expand_default_registry_uri(value)
     if raw.lower() == "disabled":
         return {"type": ""}
 
     parsed = urlparse(raw)
-    if (
-        parsed.scheme != "agentkit"
-        or parsed.netloc != "a2a-registry"
-        or parsed.path not in {"", "/"}
+    if parsed.scheme == "uni-registry" and parsed.path in {"", "/"}:
+        if not parsed.netloc:
+            raise ValueError("UniRegistry URI requires a registry ID")
+        scheme_type = "uni_registry"
+    elif (
+        parsed.scheme == "agentkit"
+        and parsed.netloc == "a2a-registry"
+        and parsed.path in {"", "/"}
     ):
+        scheme_type = "agentkit_a2a"
+    else:
         raise ValueError(
-            "Unsupported registry URI. Currently only "
-            "`agentkit://a2a-registry?space_id=xxx&top_k=3` or "
-            "`default` / `disabled` is supported."
+            "Unsupported registry URI. Use "
+            "`agentkit://a2a-registry?space_id=xxx&top_k=3`, "
+            "`uni-registry://<registry-id>?endpoint=https://...`, "
+            "or `default` / `disabled`. Only `default` / `disabled` is supported "
+            "as a non-URI registry value."
         )
 
     query = {
@@ -195,7 +205,9 @@ def _parse_registry_uri(value: str) -> dict:
             f"Known: {', '.join(sorted(_REGISTRY_QUERY_KEYS))}"
         )
 
-    section: dict = {"type": "agentkit_a2a"}
+    section: dict = {"type": scheme_type}
+    if scheme_type == "uni_registry":
+        section["id"] = parsed.netloc
     for key, raw_value in query.items():
         section[key] = _parse_registry_int(key, raw_value)
     return section
@@ -209,6 +221,8 @@ def _set_registry_value(section: dict, key: str, value: object | None) -> None:
 def _apply_registry_config(
     data: dict,
     registry: Optional[str],
+    registry_id: Optional[str],
+    registry_record_type: Optional[str],
     registry_space_id: Optional[str],
     registry_space_name: Optional[str],
     registry_top_k: Optional[int],
@@ -219,6 +233,8 @@ def _apply_registry_config(
         value is not None
         for value in [
             registry,
+            registry_id,
+            registry_record_type,
             registry_space_id,
             registry_space_name,
             registry_top_k,
@@ -239,6 +255,8 @@ def _apply_registry_config(
             section.pop("space_id", None)
         section.update(parsed_registry)
 
+    _set_registry_value(section, "id", registry_id)
+    _set_registry_value(section, "record_type", registry_record_type)
     if registry_space_name is not None:
         section.pop("space_id", None)
     _set_registry_value(section, "space_id", registry_space_id)
@@ -247,7 +265,7 @@ def _apply_registry_config(
     _set_registry_value(section, "endpoint", registry_endpoint)
     _set_registry_value(section, "region", registry_region)
 
-    if section.get("type") != "":
+    if section.get("type") not in {"", "uni_registry"}:
         section["type"] = "agentkit_a2a"
 
     if section.get("type") == "agentkit_a2a" and not section.get("space_id"):
@@ -291,6 +309,18 @@ def _apply_registry_config(
             endpoint=resolved_endpoint,
             region=resolved_region,
         )
+    elif section.get("type") == "uni_registry":
+        if not section.get("id"):
+            raise ValueError(
+                "UniRegistry id is required. Use "
+                '`--registry "uni-registry://<registry-id>?endpoint=https://..."` '
+                "or `--registry-id`."
+            )
+        if not section.get("endpoint"):
+            raise ValueError(
+                "UniRegistry endpoint is required. Set it in the URI or pass "
+                "`--registry-endpoint`."
+            )
 
 
 def _load_spec(path: Path) -> dict:
@@ -700,9 +730,18 @@ def harness_command(
         None,
         "--registry",
         help=(
-            'AgentKit A2A registry URI, "default", or "disabled", e.g. '
-            '"agentkit://a2a-registry?space_id=xxx&top_k=3".'
+            'A2A registry URI, "default", or "disabled", e.g. '
+            '"agentkit://a2a-registry?space_id=xxx&top_k=3" or '
+            '"uni-registry://reg-xxx?endpoint=https://registry.example".'
         ),
+    ),
+    registry_id: Optional[str] = typer.Option(
+        None, "--registry-id", help="UniRegistry instance ID."
+    ),
+    registry_record_type: Optional[str] = typer.Option(
+        None,
+        "--registry-record-type",
+        help="UniRegistry record type for A2A Agent Cards.",
     ),
     registry_space_id: Optional[str] = typer.Option(
         None, "--registry-space-id", help="AgentKit A2A SpaceId."
@@ -996,6 +1035,8 @@ def harness_command(
         _apply_registry_config(
             data,
             registry,
+            registry_id,
+            registry_record_type,
             registry_space_id,
             registry_space_name,
             registry_top_k,
