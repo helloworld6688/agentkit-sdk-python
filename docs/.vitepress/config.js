@@ -41,6 +41,7 @@ export default {
           items: [
             { text: 'CLI 概览', link: '/content/2.agentkit-cli/1.overview' },
             { text: '命令详解', link: '/content/2.agentkit-cli/2.commands' },
+            { text: 'UniRegistry 与 SearchSet', link: '/content/2.agentkit-cli/6.uni_registry' },
             { text: 'Harness', link: '/content/2.agentkit-cli/5.harness' },
             { text: '配置文件说明', link: '/content/2.agentkit-cli/3.configurations' },
             { text: 'Logging', link: '/content/2.agentkit-cli/4.logging' },

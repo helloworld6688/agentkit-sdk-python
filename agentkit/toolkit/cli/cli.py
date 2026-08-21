@@ -17,28 +17,10 @@
 import os
 
 import typer
-from rich.panel import Panel
 from rich.console import Console
-from agentkit.utils.logging_config import setup_cli_logging
+from rich.panel import Panel
 
-# Import command modules
-from agentkit.toolkit.cli.cli_init import init_command, show_logo
-from agentkit.toolkit.cli.cli_invoke import invoke_app
-from agentkit.toolkit.cli.cli_config import config_command
-from agentkit.toolkit.cli.cli_version import version_command, get_package_version
-from agentkit.toolkit.cli.cli_build import build_command
-from agentkit.toolkit.cli.cli_deploy import deploy_command
-from agentkit.toolkit.cli.cli_launch import launch_command
-from agentkit.toolkit.cli.cli_status import status_command
-from agentkit.toolkit.cli.cli_destroy import destroy_command
-from agentkit.toolkit.cli.cli_memory import memory_app
-from agentkit.toolkit.cli.cli_knowledge import knowledge_app
-from agentkit.toolkit.cli.cli_model_gateway import model_gateway_app
-from agentkit.toolkit.cli.cli_tools import tools_app
-from agentkit.toolkit.cli.cli_runtime import runtime_app
-from agentkit.toolkit.cli.cli_skills import skills_app
-from agentkit.toolkit.cli.cli_skill import skill_app
-from agentkit.toolkit.cli.sandbox.cli import sandbox_app
+from agentkit.toolkit.cli.cli_add import add_app
 from agentkit.toolkit.cli.cli_auth import (
     auth_app,
     credential_hosting_command,
@@ -46,10 +28,31 @@ from agentkit.toolkit.cli.cli_auth import (
     logout_command,
     whoami_command,
 )
-from agentkit.toolkit.cli.cli_add import add_app
-from agentkit.toolkit.cli.cli_list import list_app
+from agentkit.toolkit.cli.cli_build import build_command
+from agentkit.toolkit.cli.cli_config import config_command
 from agentkit.toolkit.cli.cli_delete import delete_app
+from agentkit.toolkit.cli.cli_deploy import deploy_command
+from agentkit.toolkit.cli.cli_destroy import destroy_command
+
+# Import command modules
+from agentkit.toolkit.cli.cli_init import init_command, show_logo
+from agentkit.toolkit.cli.cli_invoke import invoke_app
+from agentkit.toolkit.cli.cli_knowledge import knowledge_app
+from agentkit.toolkit.cli.cli_launch import launch_command
+from agentkit.toolkit.cli.cli_list import list_app
 from agentkit.toolkit.cli.cli_logs import logs_command
+from agentkit.toolkit.cli.cli_memory import memory_app
+from agentkit.toolkit.cli.cli_model_gateway import model_gateway_app
+from agentkit.toolkit.cli.cli_runtime import runtime_app
+from agentkit.toolkit.cli.cli_search_set import search_set_app
+from agentkit.toolkit.cli.cli_skill import skill_app
+from agentkit.toolkit.cli.cli_skills import skills_app
+from agentkit.toolkit.cli.cli_status import status_command
+from agentkit.toolkit.cli.cli_tools import tools_app
+from agentkit.toolkit.cli.cli_uni_registry import uni_registry_app
+from agentkit.toolkit.cli.cli_version import get_package_version, version_command
+from agentkit.toolkit.cli.sandbox.cli import sandbox_app
+from agentkit.utils.logging_config import setup_cli_logging
 
 # Note: Avoid importing heavy packages at the top to keep CLI startup fast
 
@@ -134,6 +137,8 @@ app.add_typer(invoke_app, name="invoke")
 app.add_typer(add_app, name="add")
 app.add_typer(list_app, name="list")
 app.add_typer(delete_app, name="delete")
+uni_registry_app.add_typer(search_set_app, name="search-set")
+app.add_typer(uni_registry_app, name="uni-reg")
 
 
 if __name__ == "__main__":
