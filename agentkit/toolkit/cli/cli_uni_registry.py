@@ -23,6 +23,11 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from agentkit.utils.global_config_io import (
+    read_global_config_dict,
+    write_global_config_dict,
+)
+
 console = Console()
 
 uni_registry_app = typer.Typer(
@@ -31,7 +36,10 @@ uni_registry_app = typer.Typer(
     add_completion=False,
 )
 record_app = typer.Typer(help="Manage records stored in UniRegistry.")
-resource_app = typer.Typer(help="Manage UniRegistry resources.")
+registry_app = typer.Typer(help="Manage cloud UniRegistry instances.")
+binding_app = typer.Typer(help="Manage local UniRegistry connection bindings.")
+
+_REGISTRY_CONFIG_CACHE: dict[str, dict[str, Any]] | None = None
 
 
 class UniRegistryAPIError(RuntimeError):
@@ -84,6 +92,150 @@ def _tags(values: list[str] | None) -> list[dict[str, str]]:
         if not key or not tag_value:
             raise typer.BadParameter("--tag must use non-empty KEY=VALUE")
         result.append({"key": key, "value": tag_value})
+    return result
+
+
+def _normalize_server(value: str) -> str:
+    server = value.strip().rstrip("/")
+    parsed = urlparse(server)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise typer.BadParameter("server must be an http(s) URL")
+    return server
+
+
+def _registry_configs(force_reload: bool = False) -> dict[str, dict[str, Any]]:
+    global _REGISTRY_CONFIG_CACHE
+    if _REGISTRY_CONFIG_CACHE is not None and not force_reload:
+        return _REGISTRY_CONFIG_CACHE
+    data = read_global_config_dict(force_reload=force_reload)
+    section = data.get("uni_registry")
+    registries = section.get("registries") if isinstance(section, dict) else None
+    if not isinstance(registries, dict):
+        registries = {}
+    _REGISTRY_CONFIG_CACHE = {
+        str(key): value for key, value in registries.items() if isinstance(value, dict)
+    }
+    return _REGISTRY_CONFIG_CACHE
+
+
+def _save_registry_configs(registries: dict[str, dict[str, Any]]) -> None:
+    global _REGISTRY_CONFIG_CACHE
+    data = read_global_config_dict(force_reload=True)
+    section = data.setdefault("uni_registry", {})
+    if not isinstance(section, dict):
+        section = {}
+        data["uni_registry"] = section
+    section["registries"] = registries
+    write_global_config_dict(data)
+    _REGISTRY_CONFIG_CACHE = registries
+
+
+def _upsert_registry_config(registry_id: str, updates: dict[str, Any]) -> None:
+    normalized_id = registry_id.strip()
+    if not normalized_id:
+        return
+    registries = dict(_registry_configs())
+    current = dict(registries.get(normalized_id, {}))
+    for key, value in updates.items():
+        if value is not None and value != "":
+            current[key] = value
+    if current:
+        registries[normalized_id] = current
+        _save_registry_configs(registries)
+
+
+def _registry_config(registry_id: str) -> dict[str, Any] | None:
+    value = _registry_configs().get(registry_id.strip())
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _mask_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key).lower() in {
+                "password",
+                "secret_key",
+                "access_key",
+                "key",
+                "api_key",
+                "apikey",
+            } and isinstance(item, str):
+                result[key] = "******"
+            else:
+                result[key] = _mask_sensitive(item)
+        return result
+    if isinstance(value, list):
+        return [_mask_sensitive(item) for item in value]
+    return value
+
+
+def _masked_registry_config(registry_id: str, value: dict[str, Any]) -> dict[str, Any]:
+    return _mask_sensitive({"registry_id": registry_id, **value})
+
+
+def _registry_id_from_response(response: Any) -> str | None:
+    registry = _registry_from_response(response)
+    if not registry:
+        return None
+    for key in ("id", "Id", "registry_id", "RegistryId"):
+        value = registry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _registry_from_response(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, dict):
+        return None
+    result = response.get("Result", response)
+    if not isinstance(result, dict):
+        return None
+    for key in ("registry", "Registry", "uni_registry", "UniRegistry"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _top_payload(top: dict[str, Any]) -> dict[str, Any]:
+    return {"Top": top} if top else {}
+
+
+def _resource_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    field_names = {
+        "id": "Id",
+        "name": "Name",
+        "replicas": "Replicas",
+        "network_spec": "NetworkSpec",
+        "monitor_spec": "MonitorSpec",
+        "project_name": "ProjectName",
+        "tags": "Tags",
+        "metadata": "Metadata",
+        "deletion_protection_enabled": "DeletionProtectionEnabled",
+        "top": "Top",
+        "page_number": "PageNumber",
+        "page_size": "PageSize",
+        "filter": "Filter",
+        "tag_filters": "TagFilters",
+    }
+    filter_names = {
+        "id": "Id",
+        "name": "Name",
+        "status": "Status",
+        "vpc_id": "VpcId",
+        "project_name": "ProjectName",
+    }
+    result: dict[str, Any] = {}
+    for key, value in payload.items():
+        target = field_names.get(key, key)
+        if key == "filter" and isinstance(value, dict):
+            result[target] = {
+                filter_names.get(filter_key, filter_key): filter_value
+                for filter_key, filter_value in value.items()
+            }
+        else:
+            result[target] = value
     return result
 
 
@@ -264,63 +416,114 @@ class UniRegistryClient:
         return self.request("DELETE", f"/api/v1/records/{quote(record_id, safe='')}")
 
     def create_resource(self, payload: dict[str, Any]) -> Any:
-        return self.request("POST", "/CreateUniRegistry", payload)
+        return self.request("POST", "/CreateUniRegistry", _resource_payload(payload))
 
     def get_resource(self, resource_id: str, top: dict[str, Any]) -> Any:
         return self.request(
-            "POST", "/GetUniRegistry", {"id": resource_id, "top": top or None}
+            "POST",
+            "/GetUniRegistry",
+            {"Id": resource_id, **_top_payload(top)},
         )
 
     def list_resources(self, payload: dict[str, Any]) -> Any:
-        return self.request("POST", "/ListUniRegistries", payload)
+        return self.request("POST", "/ListUniRegistries", _resource_payload(payload))
 
     def update_resource(self, payload: dict[str, Any]) -> Any:
-        return self.request("POST", "/UpdateUniRegistry", payload)
+        return self.request("POST", "/UpdateUniRegistry", _resource_payload(payload))
 
     def delete_resource(self, resource_id: str, top: dict[str, Any]) -> Any:
         return self.request(
-            "POST", "/DeleteUniRegistry", {"id": resource_id, "top": top or None}
+            "POST",
+            "/DeleteUniRegistry",
+            {"Id": resource_id, **_top_payload(top)},
         )
 
     def record_clients(self, registry_id: str) -> list[UniRegistryClient]:
+        cached = _registry_config(registry_id)
+        if cached:
+            clients = _clients_from_registry_config(cached, self)
+            if clients:
+                return clients
+
         registry_response = self.get_resource(registry_id, {})
-        registry = registry_response.get("registry")
+        registry = _registry_from_response(registry_response)
         if not isinstance(registry, dict):
             raise UniRegistryAPIError(
                 f"GetUniRegistry({registry_id}) did not return a registry"
             )
 
-        endpoints: list[str] = []
-        for field in ("private_address", "public_address"):
-            address = str(registry.get(field) or "").strip().rstrip("/")
-            if not address or address in endpoints:
-                continue
-            parsed = urlparse(address)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise UniRegistryAPIError(
-                    f"UniRegistry {registry_id} has invalid {field}: {address!r}"
-                )
-            endpoints.append(address)
-
-        if not endpoints:
+        updates = _registry_updates_from_registry_response(
+            registry,
+            username=self.username or None,
+            password=self.password or None,
+            region=self.region or None,
+            service=self.service or None,
+        )
+        _upsert_registry_config(registry_id, updates)
+        clients = _clients_from_registry_config(updates, self)
+        if not clients:
             raise UniRegistryAPIError(
                 f"UniRegistry {registry_id} has no private_address or public_address"
             )
-
-        return [
-            UniRegistryClient(
-                endpoint,
-                self.username or None,
-                self.password or None,
-                self.region or None,
-                self.service,
-                self.timeout,
-            )
-            for endpoint in endpoints
-        ]
+        return clients
 
     def record_client(self, registry_id: str) -> UniRegistryClient:
         return self.record_clients(registry_id)[0]
+
+
+def _registry_updates_from_registry_response(
+    registry: dict[str, Any],
+    *,
+    username: str | None,
+    password: str | None,
+    region: str | None,
+    service: str | None,
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    for source, target in [
+        ("server", "server"),
+        ("private_address", "private_address"),
+        ("PrivateAddress", "private_address"),
+        ("public_address", "public_address"),
+        ("PublicAddress", "public_address"),
+    ]:
+        value = registry.get(source)
+        if isinstance(value, str) and value.strip():
+            updates[target] = _normalize_server(value)
+    for key, value in {
+        "username": username,
+        "password": password,
+        "region": region,
+        "service": service,
+    }.items():
+        if value:
+            updates[key] = value
+    return updates
+
+
+def _clients_from_registry_config(
+    config: dict[str, Any], fallback: UniRegistryClient
+) -> list[UniRegistryClient]:
+    endpoints: list[str] = []
+    for field in ("private_address", "server", "public_address"):
+        address = str(config.get(field) or "").strip().rstrip("/")
+        if not address or address in endpoints:
+            continue
+        parsed = urlparse(address)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise UniRegistryAPIError(f"registry config has invalid {field}: {address!r}")
+        endpoints.append(address)
+    return [
+        UniRegistryClient(
+            endpoint,
+            str(config.get("username") or fallback.username or "") or None,
+            str(config.get("password") or fallback.password or "") or None,
+            str(config.get("region") or fallback.region or "") or None,
+            str(config.get("service") or fallback.service or "agentkit"),
+            fallback.timeout,
+        )
+        for endpoint in endpoints
+    ]
 
 
 def _client(options: dict[str, Any]) -> UniRegistryClient:
@@ -341,20 +544,60 @@ def _client(options: dict[str, Any]) -> UniRegistryClient:
     )
 
 
+def _registry_data_clients(
+    options: dict[str, Any], registry_id: str | None
+) -> list[UniRegistryClient]:
+    base_client = _client(options)
+    if registry_id:
+        cached = _registry_config(registry_id)
+        if cached:
+            clients = _clients_from_registry_config(cached, base_client)
+            if clients:
+                return clients
+        return base_client.record_clients(registry_id)
+    return [base_client]
+
+
 def _record_client(options: dict[str, Any], registry_id: str) -> UniRegistryClient:
     return _client(options).record_client(registry_id)
 
 
-def _call_record(options: dict[str, Any], registry_id: str, operation: Any) -> Any:
+def _call_registry_data(
+    options: dict[str, Any], registry_id: str | None, operation: Any
+) -> Any:
     last_error: UniRegistryNetworkError | None = None
-    for client in _client(options).record_clients(registry_id):
+    for client in _registry_data_clients(options, registry_id):
         try:
             return operation(client)
         except UniRegistryNetworkError as exc:
             last_error = exc
     if last_error is not None:
         raise last_error
-    raise UniRegistryAPIError(f"UniRegistry {registry_id} has no record endpoint")
+    raise UniRegistryAPIError(f"UniRegistry {registry_id} has no data-plane endpoint")
+
+
+def _call_record(options: dict[str, Any], registry_id: str, operation: Any) -> Any:
+    return _call_registry_data(options, registry_id, operation)
+
+
+def _cache_resource_response(
+    response: Any,
+    options: dict[str, Any],
+    explicit_registry_id: str | None = None,
+) -> None:
+    registry = _registry_from_response(response)
+    registry_id = explicit_registry_id or _registry_id_from_response(response)
+    if not registry or not registry_id:
+        return
+    updates = _registry_updates_from_registry_response(
+        registry,
+        username=options.get("username") or os.getenv("UNI_USERNAME"),
+        password=options.get("password") or os.getenv("UNI_PASSWORD"),
+        region=options.get("region"),
+        service=options.get("service"),
+    )
+    if updates:
+        _upsert_registry_config(registry_id, updates)
 
 
 def _print(value: Any, output: str) -> None:
@@ -548,7 +791,7 @@ def delete_record(
     )
 
 
-@resource_app.command("create")
+@registry_app.command("create")
 def create_resource(
     ctx: typer.Context,
     name: str = typer.Option(..., "--name"),
@@ -581,10 +824,12 @@ def create_resource(
     if deletion_protection_enabled is not None:
         payload["deletion_protection_enabled"] = deletion_protection_enabled
     options = _options(ctx)
-    _print(_client(options).create_resource(payload), options["output"])
+    response = _client(options).create_resource(payload)
+    _cache_resource_response(response, options)
+    _print(response, options["output"])
 
 
-@resource_app.command("get")
+@registry_app.command("get")
 def get_resource(
     ctx: typer.Context,
     resource_id: str,
@@ -592,13 +837,12 @@ def get_resource(
 ) -> None:
     """Get a managed UniRegistry resource."""
     options = _options(ctx)
-    _print(
-        _client(options).get_resource(resource_id, _json_object(top, "--top")),
-        options["output"],
-    )
+    response = _client(options).get_resource(resource_id, _json_object(top, "--top"))
+    _cache_resource_response(response, options, resource_id)
+    _print(response, options["output"])
 
 
-@resource_app.command("list")
+@registry_app.command("list")
 def list_resources(
     ctx: typer.Context,
     page: int = typer.Option(1, "--page"),
@@ -637,7 +881,7 @@ def list_resources(
     _print(_client(options).list_resources(payload), options["output"])
 
 
-@resource_app.command("update")
+@registry_app.command("update")
 def update_resource(
     ctx: typer.Context,
     resource_id: str,
@@ -666,10 +910,12 @@ def update_resource(
     if set(payload) == {"id"}:
         raise typer.BadParameter("provide at least one field to update")
     options = _options(ctx)
-    _print(_client(options).update_resource(payload), options["output"])
+    response = _client(options).update_resource(payload)
+    _cache_resource_response(response, options, resource_id)
+    _print(response, options["output"])
 
 
-@resource_app.command("delete")
+@registry_app.command("delete")
 def delete_resource(
     ctx: typer.Context,
     resource_id: str,
@@ -685,5 +931,80 @@ def delete_resource(
     )
 
 
+@binding_app.command("bind")
+def bind_registry(
+    ctx: typer.Context,
+    registry_id: str,
+    server: str | None = typer.Option(
+        None, "--server", help="Data-plane server URL."
+    ),
+    private_address: str | None = typer.Option(
+        None, "--private-address", help="Private data-plane URL."
+    ),
+    public_address: str | None = typer.Option(
+        None, "--public-address", help="Public data-plane URL."
+    ),
+    username: str | None = typer.Option(None, "--username", help="Basic-auth username."),
+    password: str | None = typer.Option(None, "--password", help="Basic-auth password."),
+    region: str | None = typer.Option(None, "--region", help="Signing region."),
+    service: str | None = typer.Option(None, "--service", help="Signing service."),
+) -> None:
+    """Bind a registry ID to cached data-plane connection settings."""
+    if not any([server, private_address, public_address]):
+        raise typer.BadParameter(
+            "provide at least one of --server, --private-address, or --public-address"
+        )
+    updates: dict[str, Any] = {}
+    if server:
+        updates["server"] = _normalize_server(server)
+    if private_address:
+        updates["private_address"] = _normalize_server(private_address)
+    if public_address:
+        updates["public_address"] = _normalize_server(public_address)
+    for key, value in {
+        "username": username,
+        "password": password,
+        "region": region,
+        "service": service,
+    }.items():
+        if value:
+            updates[key] = value
+    _upsert_registry_config(registry_id, updates)
+    _print(
+        {"registry": _masked_registry_config(registry_id, _registry_config(registry_id) or {})},
+        _options(ctx)["output"],
+    )
+
+
+@binding_app.command("get")
+def get_registry_binding(ctx: typer.Context, registry_id: str) -> None:
+    """Show cached connection settings for a registry ID."""
+    value = _registry_config(registry_id)
+    if not value:
+        raise typer.BadParameter(f"registry {registry_id!r} is not bound")
+    _print({"registry": _masked_registry_config(registry_id, value)}, _options(ctx)["output"])
+
+
+@binding_app.command("list")
+def list_registry_bindings(ctx: typer.Context) -> None:
+    """List cached registry connection settings."""
+    registries = _registry_configs()
+    items = [
+        _masked_registry_config(registry_id, value)
+        for registry_id, value in sorted(registries.items())
+    ]
+    _print({"total_count": len(items), "items": items}, _options(ctx)["output"])
+
+
+@binding_app.command("remove")
+def remove_registry_binding(ctx: typer.Context, registry_id: str) -> None:
+    """Remove cached connection settings for a registry ID."""
+    registries = dict(_registry_configs())
+    removed = registries.pop(registry_id, None) is not None
+    _save_registry_configs(registries)
+    _print({"success": removed}, _options(ctx)["output"])
+
+
 uni_registry_app.add_typer(record_app, name="record")
-uni_registry_app.add_typer(resource_app, name="resource")
+registry_app.add_typer(binding_app, name="binding")
+uni_registry_app.add_typer(registry_app, name="registry")
