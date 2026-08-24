@@ -294,6 +294,54 @@ def test_resource_list_uses_openapi_action_query_for_byted_endpoint(monkeypatch)
     )
 
 
+def test_registry_get_masks_initial_password_and_skips_unusable_address(
+    monkeypatch,
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    monkeypatch.setattr(
+        registry.requests,
+        "request",
+        lambda *_args, **_kwargs: _Response(
+            {
+                "Result": {
+                    "Registry": {
+                        "Id": "ur-1",
+                        "PublicAddress": "115.190.137.250:80",
+                        "InitialPassword": "should-not-be-printed",
+                    }
+                }
+            }
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://control.test",
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "registry",
+            "get",
+            "ur-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "should-not-be-printed" not in result.output
+    assert '"InitialPassword": "******"' in result.output
+    assert registry._registry_config("ur-1") == {
+        "username": "admin",
+        "password": "secret",
+        "service": "agentkit",
+    }
+
+
 def test_search_set_create_then_provisions_mcp_and_reads_toolset(monkeypatch):
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
@@ -499,7 +547,7 @@ def test_search_set_search_uses_scoped_search_endpoint(monkeypatch):
     assert json.loads(calls[0][2]["data"]) == {"query": "export financial report"}
 
 
-def test_registry_bind_persists_connection_and_masks_password(monkeypatch):
+def test_registry_binding_persists_connection_and_masks_password():
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
 
@@ -508,6 +556,7 @@ def test_registry_bind_persists_connection_and_masks_password(monkeypatch):
         [
             "uni-reg",
             "registry",
+            "binding",
             "bind",
             "ur-direct",
             "--server",

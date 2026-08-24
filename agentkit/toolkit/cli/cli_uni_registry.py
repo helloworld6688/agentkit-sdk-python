@@ -153,14 +153,17 @@ def _mask_sensitive(value: Any) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, item in value.items():
-            if str(key).lower() in {
-                "password",
-                "secret_key",
-                "access_key",
-                "key",
-                "api_key",
-                "apikey",
-            } and isinstance(item, str):
+            normalized_key = str(key).lower()
+            if (
+                normalized_key in {
+                    "key",
+                    "api_key",
+                    "apikey",
+                }
+                or "password" in normalized_key
+                or "secret" in normalized_key
+                or "access_key" in normalized_key
+            ) and isinstance(item, str):
                 result[key] = "******"
             else:
                 result[key] = _mask_sensitive(item)
@@ -489,7 +492,11 @@ def _registry_updates_from_registry_response(
     ]:
         value = registry.get(source)
         if isinstance(value, str) and value.strip():
-            updates[target] = _normalize_server(value)
+            try:
+                updates[target] = _normalize_server(value)
+            except typer.BadParameter:
+                # A provisioning instance can expose an address before it is usable.
+                continue
     for key, value in {
         "username": username,
         "password": password,
@@ -597,7 +604,11 @@ def _cache_resource_response(
         service=options.get("service"),
     )
     if updates:
-        _upsert_registry_config(registry_id, updates)
+        try:
+            _upsert_registry_config(registry_id, updates)
+        except OSError:
+            # A read-only local config must not invalidate a control-plane result.
+            return
 
 
 def _print(value: Any, output: str) -> None:
@@ -826,7 +837,7 @@ def create_resource(
     options = _options(ctx)
     response = _client(options).create_resource(payload)
     _cache_resource_response(response, options)
-    _print(response, options["output"])
+    _print(_mask_sensitive(response), options["output"])
 
 
 @registry_app.command("get")
@@ -839,7 +850,7 @@ def get_resource(
     options = _options(ctx)
     response = _client(options).get_resource(resource_id, _json_object(top, "--top"))
     _cache_resource_response(response, options, resource_id)
-    _print(response, options["output"])
+    _print(_mask_sensitive(response), options["output"])
 
 
 @registry_app.command("list")
@@ -878,7 +889,7 @@ def list_resources(
     if parsed_top:
         payload["top"] = parsed_top
     options = _options(ctx)
-    _print(_client(options).list_resources(payload), options["output"])
+    _print(_mask_sensitive(_client(options).list_resources(payload)), options["output"])
 
 
 @registry_app.command("update")
@@ -912,7 +923,7 @@ def update_resource(
     options = _options(ctx)
     response = _client(options).update_resource(payload)
     _cache_resource_response(response, options, resource_id)
-    _print(response, options["output"])
+    _print(_mask_sensitive(response), options["output"])
 
 
 @registry_app.command("delete")
@@ -924,8 +935,10 @@ def delete_resource(
     """Delete a managed UniRegistry resource."""
     options = _options(ctx)
     _print(
-        _client(options).delete_resource(
-            resource_id, _json_object(top, "--top")
+        _mask_sensitive(
+            _client(options).delete_resource(
+                resource_id, _json_object(top, "--top")
+            )
         ),
         options["output"],
     )
