@@ -26,6 +26,7 @@ def isolated_uni_registry_config(monkeypatch):
     monkeypatch.setattr(registry, "_REGISTRY_CONFIG_CACHE", None)
     monkeypatch.setattr(registry, "read_global_config_dict", read_config)
     monkeypatch.setattr(registry, "write_global_config_dict", write_config)
+    yield store
 
 
 class _Response:
@@ -148,6 +149,145 @@ def test_record_list_falls_back_to_public_address_when_private_unreachable(
     assert calls[2][0:2] == ("GET", "https://public.registry.test/api/v1/records")
 
 
+def test_record_list_uses_default_registry_id_from_config(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {"registry_id": "ur-default"},
+                "registries": {
+                    "ur-default": {
+                        "server": "https://data.registry.test",
+                        "username": "admin",
+                        "password": "secret",
+                    }
+                },
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"items": []})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+
+    result = runner.invoke(app, ["uni-reg", "record", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:2] == ("GET", "https://data.registry.test/api/v1/records")
+
+
+def test_record_create_accepts_full_json_body(monkeypatch, isolated_uni_registry_config):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {"registry_id": "ur-default"},
+                "registries": {"ur-default": {"server": "https://data.registry.test"}},
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"id": "record-1"})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "record",
+            "create",
+            "--json",
+            json.dumps(
+                {
+                    "name": "agent",
+                    "type": "mcp",
+                    "record_version": "v1",
+                    "data": {"endpoint": "https://agent.test/mcp"},
+                    "network_config": {"url": "https://agent.test/mcp"},
+                }
+            ),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:2] == ("POST", "https://data.registry.test/api/v1/records")
+    payload = json.loads(calls[0][2]["data"])
+    assert payload == {
+        "name": "agent",
+        "type": "mcp",
+        "record_version": "v1",
+        "data": '{"endpoint": "https://agent.test/mcp"}',
+        "network_config": '{"url": "https://agent.test/mcp"}',
+    }
+
+
+def test_record_create_accepts_json_file(
+    monkeypatch, isolated_uni_registry_config, tmp_path
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {"registry_id": "ur-default"},
+                "registries": {"ur-default": {"server": "https://data.registry.test"}},
+            }
+        }
+    )
+    body_path = tmp_path / "record.json"
+    body_path.write_text(
+        json.dumps(
+            {
+                "name": "agent",
+                "type": "mcp",
+                "record_version": "v1",
+                "data": {"endpoint": "https://agent.test/mcp"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"id": "record-1"})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "record",
+            "create",
+            "--json-file",
+            str(body_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {
+        "name": "agent",
+        "type": "mcp",
+        "record_version": "v1",
+        "data": '{"endpoint": "https://agent.test/mcp"}',
+    }
+
+
 def test_resource_list_uses_rpc_path_and_signs_request(monkeypatch):
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
@@ -196,6 +336,183 @@ def test_resource_list_uses_rpc_path_and_signs_request(monkeypatch):
         "Filter": {"Id": ["ur-1"], "Status": ["RUNNING"]},
     }
     assert calls[0][2]["headers"]["Authorization"].startswith("HMAC-SHA256 ")
+
+
+def test_resource_create_accepts_full_json_body(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"Result": {"Id": "ur-1"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://open.volcengineapi.com",
+            "registry",
+            "create",
+            "--json",
+            json.dumps(
+                {
+                    "Name": "uni-public-demo",
+                    "Replicas": 1,
+                    "DeletionProtectionEnabled": True,
+                    "NetworkSpec": {
+                        "NetworkType": ["PUBLIC"],
+                        "EipBandwidth": 1,
+                        "IpVersion": "IPv4",
+                    },
+                }
+            ),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:2] == ("POST", "https://open.volcengineapi.com/")
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "uni-public-demo",
+        "Replicas": 1,
+        "DeletionProtectionEnabled": True,
+        "NetworkSpec": {
+            "NetworkType": ["PUBLIC"],
+            "EipBandwidth": 1,
+            "IpVersion": "IPv4",
+        },
+    }
+
+
+def test_resource_list_reads_connection_defaults_from_config(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "server": "https://registry-config.test",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "list",
+            "--page",
+            "1",
+            "--page-size",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:2] == (
+        "POST",
+        "https://registry-config.test/ListUniRegistries",
+    )
+    assert calls[0][2]["headers"]["Authorization"].startswith(
+        "HMAC-SHA256 Credential=ak/"
+    )
+    assert "/cn-beijing/agentkit_stg/request" in calls[0][2]["headers"][
+        "Authorization"
+    ]
+
+
+def test_resource_list_cli_options_override_connection_defaults(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "server": "https://registry-config.test",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://registry-cli.test",
+            "--region",
+            "cn-shanghai",
+            "--service",
+            "agentkit",
+            "registry",
+            "list",
+            "--page",
+            "1",
+            "--page-size",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:2] == ("POST", "https://registry-cli.test/ListUniRegistries")
+    assert "/cn-shanghai/agentkit/request" in calls[0][2]["headers"][
+        "Authorization"
+    ]
 
 
 def test_resource_list_uses_openapi_action_query_for_volcengine_endpoint(

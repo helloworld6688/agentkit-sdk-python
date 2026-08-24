@@ -17,10 +17,13 @@ from .cli_uni_registry import (
     _call_registry_data,
     _client,
     _json_object,
+    _json_request,
     _mask_sensitive,
     _options,
     _print,
     _registry_config,
+    _default_registry_id,
+    _resolve_connection_options,
     _upsert_registry_config,
 )
 
@@ -32,10 +35,11 @@ class MCPControlClient:
 
     def __init__(self, options: dict[str, Any]) -> None:
         control_client = _client(options)
+        resolved = _resolve_connection_options(options)
         self._client = UniRegistryClient(
             control_client.server,
-            region=options["region"],
-            service=options["service"],
+            region=resolved["region"],
+            service=resolved["service"],
         )
 
     def create_mcp_service(self, payload: dict[str, Any]) -> Any:
@@ -124,27 +128,37 @@ def _mcp_service(response: Any) -> dict[str, Any]:
 
 
 def _search_set_payload(
-    name: str,
-    resource_ids: list[str],
+    name: str | None,
+    resource_ids: list[str] | None,
     description: str | None,
     search_config: str | None,
+    json_body: str | None = None,
+    json_file: str | None = None,
 ) -> dict[str, Any]:
-    normalized_ids = [resource_id.strip() for resource_id in resource_ids]
-    if not normalized_ids or any(not resource_id for resource_id in normalized_ids):
-        raise typer.BadParameter("provide at least one non-empty --resource-id")
-    payload: dict[str, Any] = {"name": name, "resource_ids": normalized_ids}
+    payload = _json_request(json_body, json_file)
+    if name is not None:
+        payload["name"] = name
+    if resource_ids is not None:
+        normalized_ids = [resource_id.strip() for resource_id in resource_ids]
+        if not normalized_ids or any(not resource_id for resource_id in normalized_ids):
+            raise typer.BadParameter("provide at least one non-empty --resource-id")
+        payload["resource_ids"] = normalized_ids
     if description is not None:
         payload["description"] = description
     parsed_config = _json_object(search_config, "--search-config")
     if parsed_config:
         payload["search_config"] = parsed_config
+    if "name" not in payload:
+        raise typer.BadParameter("provide --name or name in --json")
+    if "resource_ids" not in payload:
+        raise typer.BadParameter("provide --resource-id or resource_ids in --json")
     return payload
 
 
 def _call_search_set(
     options: dict[str, Any], registry_id: str | None, operation: Any
 ) -> Any:
-    return _call_registry_data(options, registry_id, operation)
+    return _call_registry_data(options, registry_id or _default_registry_id(), operation)
 
 
 def _toolset_id_from_search_set(response: Any) -> str | None:
@@ -266,8 +280,8 @@ def _provision_mcp_route(
 @search_set_app.command("create")
 def create_search_set(
     ctx: typer.Context,
-    name: str = typer.Option(..., "--name"),
-    resource_id: list[str] = typer.Option(..., "--resource-id"),
+    name: str | None = typer.Option(None, "--name"),
+    resource_id: list[str] | None = typer.Option(None, "--resource-id"),
     registry_id: str | None = typer.Option(
         None, "--registry-id", help="Cached UniRegistry ID for data-plane access."
     ),
@@ -285,6 +299,10 @@ def create_search_set(
         "--mcp-toolset-id",
         help="MCPToolset ID to query after MCP Service creation.",
     ),
+    json_body: str | None = typer.Option(None, "--json", help="Full request JSON."),
+    json_file: str | None = typer.Option(
+        None, "--json-file", help="Read full request JSON from a file."
+    ),
     wait_timeout: float = typer.Option(
         180, "--wait-timeout", min=1, help="MCPToolset readiness timeout in seconds."
     ),
@@ -294,10 +312,13 @@ def create_search_set(
 ) -> None:
     """Create a SearchSet, then provision its MCP Service and query its Toolset."""
     options = _options(ctx)
-    payload = _search_set_payload(name, resource_id, description, search_config)
+    resolved_registry_id = registry_id or _default_registry_id()
+    payload = _search_set_payload(
+        name, resource_id, description, search_config, json_body, json_file
+    )
     search_set = _call_search_set(
         options,
-        registry_id,
+        resolved_registry_id,
         lambda client: client.request("POST", "/api/v1/search-sets", payload),
     )
 
@@ -306,8 +327,8 @@ def create_search_set(
         result.update(
             _provision_mcp_route(
                 options,
-                registry_id,
-                name,
+                resolved_registry_id,
+                str(payload.get("name") or name),
                 mcp_service,
                 mcp_toolset_id,
                 wait_interval,
@@ -320,7 +341,11 @@ def create_search_set(
             toolset_id, wait_interval, wait_timeout
         )
         result["mcp_toolset"] = mcp_toolset_response
-        _persist_mcp_route(registry_id, name, mcp_toolset=mcp_toolset_response)
+        _persist_mcp_route(
+            resolved_registry_id,
+            str(payload.get("name") or name),
+            mcp_toolset=mcp_toolset_response,
+        )
     _print(_mask_sensitive(result), options["output"])
 
 
@@ -350,11 +375,12 @@ def provision_mcp(
 ) -> None:
     """Provision a gateway MCP Service for an existing SearchSet."""
     options = _options(ctx)
+    resolved_registry_id = registry_id or _default_registry_id()
     _print(
         _mask_sensitive(
             _provision_mcp_route(
                 options,
-                registry_id,
+                resolved_registry_id,
                 name,
                 mcp_service,
                 mcp_toolset_id,
@@ -417,7 +443,7 @@ def list_search_sets(
 def update_search_set(
     ctx: typer.Context,
     name: str,
-    resource_id: list[str] = typer.Option(..., "--resource-id"),
+    resource_id: list[str] | None = typer.Option(None, "--resource-id"),
     registry_id: str | None = typer.Option(
         None, "--registry-id", help="Cached UniRegistry ID for data-plane access."
     ),
@@ -425,10 +451,16 @@ def update_search_set(
     search_config: str | None = typer.Option(
         None, "--search-config", help="Search config JSON."
     ),
+    json_body: str | None = typer.Option(None, "--json", help="Additional request JSON."),
+    json_file: str | None = typer.Option(
+        None, "--json-file", help="Read additional request JSON from a file."
+    ),
 ) -> None:
     """Replace the records and configuration of a SearchSet."""
     options = _options(ctx)
-    payload = _search_set_payload(name, resource_id, description, search_config)
+    payload = _search_set_payload(
+        name, resource_id, description, search_config, json_body, json_file
+    )
     payload.pop("name")
     _print(
         _call_search_set(

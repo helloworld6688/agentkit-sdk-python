@@ -66,6 +66,41 @@ def _json_object(value: str | None, option_name: str) -> dict[str, Any]:
     return result
 
 
+def _json_request(
+    json_body: str | None,
+    json_file: str | None,
+    option_name: str = "--json",
+) -> dict[str, Any]:
+    if json_body and json_file:
+        raise typer.BadParameter(f"provide only one of {option_name} or --json-file")
+    if json_file:
+        try:
+            value = Path(json_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise typer.BadParameter(f"cannot read --json-file: {exc}") from exc
+        return _json_object(value, "--json-file")
+    return _json_object(json_body, option_name)
+
+
+def _has_any_key(payload: dict[str, Any], *keys: str) -> bool:
+    return any(key in payload for key in keys)
+
+
+def _require_payload_keys(payload: dict[str, Any], option_name: str, *keys: str) -> None:
+    missing = [key for key in keys if key not in payload]
+    if missing:
+        joined = ", ".join(missing)
+        raise typer.BadParameter(f"{option_name} must include: {joined}")
+
+
+def _stringify_record_json_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("data", "network_config", "extensions"):
+        value = payload.get(key)
+        if isinstance(value, (dict, list)):
+            payload[key] = json.dumps(value, ensure_ascii=False)
+    return payload
+
+
 def _data_value(data: str | None, data_file: str | None) -> str:
     if bool(data) == bool(data_file):
         raise typer.BadParameter("provide exactly one of --data or --data-file")
@@ -103,13 +138,72 @@ def _normalize_server(value: str) -> str:
     return server
 
 
+def _uni_registry_section(force_reload: bool = False) -> dict[str, Any]:
+    data = read_global_config_dict(force_reload=force_reload)
+    section = data.get("uni_registry")
+    return section if isinstance(section, dict) else {}
+
+
+def _uni_registry_defaults() -> dict[str, Any]:
+    section = _uni_registry_section()
+    defaults = section.get("defaults")
+    if not isinstance(defaults, dict):
+        defaults = {}
+    result = dict(defaults)
+    for key in ("server", "region", "service", "username", "password", "registry_id"):
+        value = section.get(key)
+        if value not in (None, "") and key not in result:
+            result[key] = value
+    value = section.get("default_registry_id")
+    if value not in (None, "") and "registry_id" not in result:
+        result["registry_id"] = value
+    return result
+
+
+def _resolve_connection_options(options: dict[str, Any]) -> dict[str, Any]:
+    defaults = _uni_registry_defaults()
+    return {
+        **options,
+        "server": (
+            options.get("server")
+            or os.getenv("UNI_REGISTRY_SERVER_URL")
+            or defaults.get("server")
+        ),
+        "username": (
+            options.get("username")
+            or os.getenv("UNI_USERNAME")
+            or defaults.get("username")
+        ),
+        "password": (
+            options.get("password")
+            or os.getenv("UNI_PASSWORD")
+            or defaults.get("password")
+        ),
+        "region": options.get("region") or defaults.get("region"),
+        "service": options.get("service") or defaults.get("service") or "agentkit",
+    }
+
+
+def _default_registry_id() -> str | None:
+    resolved = str(_uni_registry_defaults().get("registry_id") or "").strip()
+    return resolved or None
+
+
+def _resolve_registry_id(registry_id: str | None) -> str:
+    resolved = (registry_id or _default_registry_id() or "").strip()
+    if not resolved:
+        raise typer.BadParameter(
+            "provide --registry-id or set uni_registry.defaults.registry_id"
+        )
+    return resolved
+
+
 def _registry_configs(force_reload: bool = False) -> dict[str, dict[str, Any]]:
     global _REGISTRY_CONFIG_CACHE
     if _REGISTRY_CONFIG_CACHE is not None and not force_reload:
         return _REGISTRY_CONFIG_CACHE
-    data = read_global_config_dict(force_reload=force_reload)
-    section = data.get("uni_registry")
-    registries = section.get("registries") if isinstance(section, dict) else None
+    section = _uni_registry_section(force_reload=force_reload)
+    registries = section.get("registries")
     if not isinstance(registries, dict):
         registries = {}
     _REGISTRY_CONFIG_CACHE = {
@@ -534,20 +628,21 @@ def _clients_from_registry_config(
 
 
 def _client(options: dict[str, Any]) -> UniRegistryClient:
-    server = options["server"] or os.getenv("UNI_REGISTRY_SERVER_URL")
+    resolved = _resolve_connection_options(options)
+    server = resolved["server"]
     if not server:
         from agentkit.platform import VolcConfiguration
 
-        endpoint = VolcConfiguration(region=options["region"]).get_service_endpoint(
+        endpoint = VolcConfiguration(region=resolved["region"]).get_service_endpoint(
             "agentkit"
         )
         server = f"{endpoint.scheme}://{endpoint.host}"
     return UniRegistryClient(
         server,
-        options["username"] or os.getenv("UNI_USERNAME"),
-        options["password"] or os.getenv("UNI_PASSWORD"),
-        options["region"],
-        options["service"],
+        resolved["username"],
+        resolved["password"],
+        resolved["region"],
+        resolved["service"],
     )
 
 
@@ -596,12 +691,13 @@ def _cache_resource_response(
     registry_id = explicit_registry_id or _registry_id_from_response(response)
     if not registry or not registry_id:
         return
+    resolved = _resolve_connection_options(options)
     updates = _registry_updates_from_registry_response(
         registry,
-        username=options.get("username") or os.getenv("UNI_USERNAME"),
-        password=options.get("password") or os.getenv("UNI_PASSWORD"),
-        region=options.get("region"),
-        service=options.get("service"),
+        username=resolved.get("username"),
+        password=resolved.get("password"),
+        region=resolved.get("region"),
+        service=resolved.get("service"),
     )
     if updates:
         try:
@@ -644,8 +740,8 @@ def configure_uni_registry(
     region: str | None = typer.Option(
         None, "--region", help="Volcengine signing region."
     ),
-    service: str = typer.Option(
-        "agentkit", "--service", help="Volcengine signing service."
+    service: str | None = typer.Option(
+        None, "--service", help="Volcengine signing service."
     ),
     output: str = typer.Option(
         "json", "--output", "-o", help="Output format: json|table."
@@ -667,34 +763,43 @@ def configure_uni_registry(
 @record_app.command("create")
 def create_record(
     ctx: typer.Context,
-    registry_id: str = typer.Option(..., "--registry-id"),
-    name: str = typer.Option(..., "--name"),
-    record_type: str = typer.Option(..., "--type"),
-    record_version: str = typer.Option(..., "--record-version"),
+    registry_id: str | None = typer.Option(None, "--registry-id"),
+    name: str | None = typer.Option(None, "--name"),
+    record_type: str | None = typer.Option(None, "--type"),
+    record_version: str | None = typer.Option(None, "--record-version"),
     data: str | None = typer.Option(None, "--data"),
     data_file: str | None = typer.Option(None, "--data-file"),
     description: str | None = typer.Option(None, "--description"),
     network_config: str | None = typer.Option(None, "--network-config"),
     extensions: str | None = typer.Option(None, "--extensions"),
+    json_body: str | None = typer.Option(None, "--json", help="Full request JSON."),
+    json_file: str | None = typer.Option(
+        None, "--json-file", help="Read full request JSON from a file."
+    ),
 ) -> None:
     """Create a record."""
-    payload: dict[str, Any] = {
+    payload = _json_request(json_body, json_file)
+    for key, value in {
         "name": name,
         "type": record_type,
         "record_version": record_version,
-        "data": _data_value(data, data_file),
-    }
-    for key, value in {
         "description": description,
         "network_config": network_config,
         "extensions": extensions,
     }.items():
         if value is not None:
             payload[key] = value
+    if data is not None or data_file is not None:
+        payload["data"] = _data_value(data, data_file)
+    elif "data" not in payload:
+        raise typer.BadParameter("provide --data, --data-file, or data in --json")
+    _require_payload_keys(payload, "--json", "name", "type", "record_version", "data")
+    _stringify_record_json_fields(payload)
     options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
     _print(
         _call_record(
-            options, registry_id, lambda client: client.create_record(payload)
+            options, resolved_registry_id, lambda client: client.create_record(payload)
         ),
         options["output"],
     )
@@ -704,12 +809,15 @@ def create_record(
 def get_record(
     ctx: typer.Context,
     record_id: str,
-    registry_id: str = typer.Option(..., "--registry-id"),
+    registry_id: str | None = typer.Option(None, "--registry-id"),
 ) -> None:
     """Get a record by ID."""
     options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
     _print(
-        _call_record(options, registry_id, lambda client: client.get_record(record_id)),
+        _call_record(
+            options, resolved_registry_id, lambda client: client.get_record(record_id)
+        ),
         options["output"],
     )
 
@@ -717,7 +825,7 @@ def get_record(
 @record_app.command("list")
 def list_records(
     ctx: typer.Context,
-    registry_id: str = typer.Option(..., "--registry-id"),
+    registry_id: str | None = typer.Option(None, "--registry-id"),
     page: int = typer.Option(1, "--page"),
     page_size: int = typer.Option(10, "--page-size"),
     name_contains: str | None = typer.Option(None, "--name-contains"),
@@ -736,8 +844,11 @@ def list_records(
         if value is not None:
             params[key] = value
     options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
     _print(
-        _call_record(options, registry_id, lambda client: client.list_records(params)),
+        _call_record(
+            options, resolved_registry_id, lambda client: client.list_records(params)
+        ),
         options["output"],
     )
 
@@ -746,7 +857,7 @@ def list_records(
 def update_record(
     ctx: typer.Context,
     record_id: str,
-    registry_id: str = typer.Option(..., "--registry-id"),
+    registry_id: str | None = typer.Option(None, "--registry-id"),
     name: str | None = typer.Option(None, "--name"),
     description: str | None = typer.Option(None, "--description"),
     record_type: str | None = typer.Option(None, "--type"),
@@ -756,30 +867,39 @@ def update_record(
     extensions: str | None = typer.Option(None, "--extensions"),
     status: str | None = typer.Option(None, "--status"),
     error_message: str | None = typer.Option(None, "--error-message"),
+    json_body: str | None = typer.Option(None, "--json", help="Additional request JSON."),
+    json_file: str | None = typer.Option(
+        None, "--json-file", help="Read additional request JSON from a file."
+    ),
 ) -> None:
     """Update only the supplied fields of a record."""
-    payload = {
-        key: value
-        for key, value in {
-            "name": name,
-            "description": description,
-            "type": record_type,
-            "record_version": record_version,
-            "data": data,
-            "network_config": network_config,
-            "extensions": extensions,
-            "status": status,
-            "error_message": error_message,
-        }.items()
-        if value is not None
-    }
+    payload = _json_request(json_body, json_file)
+    payload.update(
+        {
+            key: value
+            for key, value in {
+                "name": name,
+                "description": description,
+                "type": record_type,
+                "record_version": record_version,
+                "data": data,
+                "network_config": network_config,
+                "extensions": extensions,
+                "status": status,
+                "error_message": error_message,
+            }.items()
+            if value is not None
+        }
+    )
     if not payload:
         raise typer.BadParameter("provide at least one field to update")
+    _stringify_record_json_fields(payload)
     options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
     _print(
         _call_record(
             options,
-            registry_id,
+            resolved_registry_id,
             lambda client: client.update_record(record_id, payload),
         ),
         options["output"],
@@ -790,13 +910,16 @@ def update_record(
 def delete_record(
     ctx: typer.Context,
     record_id: str,
-    registry_id: str = typer.Option(..., "--registry-id"),
+    registry_id: str | None = typer.Option(None, "--registry-id"),
 ) -> None:
     """Delete a record by ID."""
     options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
     _print(
         _call_record(
-            options, registry_id, lambda client: client.delete_record(record_id)
+            options,
+            resolved_registry_id,
+            lambda client: client.delete_record(record_id),
         ),
         options["output"],
     )
@@ -805,8 +928,8 @@ def delete_record(
 @registry_app.command("create")
 def create_resource(
     ctx: typer.Context,
-    name: str = typer.Option(..., "--name"),
-    replicas: int = typer.Option(..., "--replicas", min=1),
+    name: str | None = typer.Option(None, "--name"),
+    replicas: int | None = typer.Option(None, "--replicas", min=1),
     network_spec: str | None = typer.Option(None, "--network-spec"),
     monitor_spec: str | None = typer.Option(None, "--monitor-spec"),
     project_name: str | None = typer.Option(None, "--project-name"),
@@ -817,10 +940,16 @@ def create_resource(
     ),
     top: str | None = typer.Option(None, "--top"),
     json_body: str | None = typer.Option(None, "--json", help="Full request JSON."),
+    json_file: str | None = typer.Option(
+        None, "--json-file", help="Read full request JSON from a file."
+    ),
 ) -> None:
     """Create a managed UniRegistry resource."""
-    payload = _json_object(json_body, "--json")
-    payload.update({"name": name, "replicas": replicas})
+    payload = _json_request(json_body, json_file)
+    if name is not None:
+        payload["name"] = name
+    if replicas is not None:
+        payload["replicas"] = replicas
     mappings = {
         "network_spec": _json_object(network_spec, "--network-spec"),
         "monitor_spec": _json_object(monitor_spec, "--monitor-spec"),
@@ -834,6 +963,10 @@ def create_resource(
         payload["tags"] = _tags(tag)
     if deletion_protection_enabled is not None:
         payload["deletion_protection_enabled"] = deletion_protection_enabled
+    if not _has_any_key(payload, "name", "Name"):
+        raise typer.BadParameter("provide --name or Name/name in --json")
+    if not _has_any_key(payload, "replicas", "Replicas"):
+        raise typer.BadParameter("provide --replicas or Replicas/replicas in --json")
     options = _options(ctx)
     response = _client(options).create_resource(payload)
     _cache_resource_response(response, options)
@@ -904,9 +1037,12 @@ def update_resource(
     json_body: str | None = typer.Option(
         None, "--json", help="Additional request JSON."
     ),
+    json_file: str | None = typer.Option(
+        None, "--json-file", help="Read additional request JSON from a file."
+    ),
 ) -> None:
     """Update a managed UniRegistry resource."""
-    payload = _json_object(json_body, "--json")
+    payload = _json_request(json_body, json_file)
     payload["id"] = resource_id
     if replicas is not None:
         payload["replicas"] = replicas
