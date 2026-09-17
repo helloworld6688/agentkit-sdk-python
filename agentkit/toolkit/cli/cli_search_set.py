@@ -23,6 +23,7 @@ from .cli_uni_registry import (
     _print,
     _registry_config,
     _default_registry_id,
+    _handle_api_errors,
     _resolve_connection_options,
     _upsert_registry_config,
 )
@@ -278,6 +279,7 @@ def _provision_mcp_route(
 
 
 @search_set_app.command("create")
+@_handle_api_errors
 def create_search_set(
     ctx: typer.Context,
     name: str | None = typer.Option(None, "--name"),
@@ -350,6 +352,7 @@ def create_search_set(
 
 
 @search_set_app.command("provision-mcp")
+@_handle_api_errors
 def provision_mcp(
     ctx: typer.Context,
     name: str,
@@ -393,6 +396,7 @@ def provision_mcp(
 
 
 @search_set_app.command("get")
+@_handle_api_errors
 def get_search_set(
     ctx: typer.Context,
     name: str,
@@ -415,6 +419,7 @@ def get_search_set(
 
 
 @search_set_app.command("list")
+@_handle_api_errors
 def list_search_sets(
     ctx: typer.Context,
     registry_id: str | None = typer.Option(
@@ -440,6 +445,7 @@ def list_search_sets(
 
 
 @search_set_app.command("update")
+@_handle_api_errors
 def update_search_set(
     ctx: typer.Context,
     name: str,
@@ -475,6 +481,7 @@ def update_search_set(
 
 
 @search_set_app.command("delete")
+@_handle_api_errors
 def delete_search_set(
     ctx: typer.Context,
     name: str,
@@ -497,6 +504,7 @@ def delete_search_set(
 
 
 @search_set_app.command("search")
+@_handle_api_errors
 def search_in_set(
     ctx: typer.Context,
     name: str,

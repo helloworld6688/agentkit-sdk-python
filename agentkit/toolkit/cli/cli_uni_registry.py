@@ -10,14 +10,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import hashlib
 import hmac
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
 
+import click
 import requests
 import typer
 from rich.console import Console
@@ -29,6 +32,7 @@ from agentkit.utils.global_config_io import (
 )
 
 console = Console()
+error_console = Console(stderr=True)
 
 uni_registry_app = typer.Typer(
     name="uni-reg",
@@ -40,9 +44,10 @@ registry_app = typer.Typer(help="Manage cloud UniRegistry instances.")
 binding_app = typer.Typer(help="Manage local UniRegistry connection bindings.")
 
 _REGISTRY_CONFIG_CACHE: dict[str, dict[str, Any]] | None = None
+_A2A_SYNCER_TOTAL_TIMEOUT_SECONDS = 30 * 60
 
 
-class UniRegistryAPIError(RuntimeError):
+class UniRegistryAPIError(click.ClickException):
     """An unsuccessful response from a UniRegistry endpoint."""
 
 
@@ -99,6 +104,70 @@ def _stringify_record_json_fields(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (dict, list)):
             payload[key] = json.dumps(value, ensure_ascii=False)
     return payload
+
+
+def _format_api_error(status_code: int, text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        body = text.strip()
+        return f"HTTP {status_code}: {body[:1000]}" if body else f"HTTP {status_code}"
+
+    if isinstance(payload, dict):
+        metadata = payload.get("ResponseMetadata")
+        if isinstance(metadata, dict):
+            error = metadata.get("Error")
+            if isinstance(error, dict):
+                code = str(error.get("Code") or "").strip()
+                message = str(error.get("Message") or "").strip()
+                request_id = _request_id_from_response(payload) or ""
+                action = str(metadata.get("Action") or "").strip()
+                parts = [f"HTTP {status_code}"]
+                if code:
+                    parts.append(code)
+                if message:
+                    parts.append(message)
+                suffix = []
+                if action:
+                    suffix.append(f"action={action}")
+                if request_id:
+                    suffix.append(f"request_id={request_id}")
+                result = ": ".join(parts)
+                if suffix:
+                    result = f"{result} ({', '.join(suffix)})"
+                return result
+
+        request_id = _request_id_from_response(payload)
+        message = payload.get("message") or payload.get("Message") or payload.get("error")
+        if isinstance(message, str) and message.strip():
+            result = f"HTTP {status_code}: {message.strip()}"
+            if request_id:
+                result = f"{result} (request_id={request_id})"
+            return result
+
+    return f"HTTP {status_code}: {json.dumps(_mask_sensitive(payload), ensure_ascii=False)[:1000]}"
+
+
+def _api_error_message(exc: UniRegistryAPIError) -> str:
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message:
+        return message
+    return str(exc)
+
+
+def _handle_api_errors(func: Any) -> Any:
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except UniRegistryAPIError as exc:
+            error_console.print("Error:", highlight=False, soft_wrap=True)
+            message = _api_error_message(exc)
+            for line in message.splitlines() or [message]:
+                error_console.print(f"  {line}", highlight=False, soft_wrap=True)
+            raise typer.Exit(1) from exc
+
+    return wrapper
 
 
 def _data_value(data: str | None, data_file: str | None) -> str:
@@ -271,15 +340,501 @@ def _masked_registry_config(registry_id: str, value: dict[str, Any]) -> dict[str
     return _mask_sensitive({"registry_id": registry_id, **value})
 
 
+def _request_id_from_response(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    for key in ("request_id", "requestId", "RequestId"):
+        value = response.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    metadata = response.get("ResponseMetadata")
+    if isinstance(metadata, dict):
+        for key in ("RequestId", "requestId", "request_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def _registry_id_from_response(response: Any) -> str | None:
+    registry = _registry_from_response(response)
+    candidates: list[dict[str, Any]] = []
+    if registry:
+        candidates.append(registry)
+    if isinstance(response, dict):
+        result = response.get("Result")
+        if isinstance(result, dict):
+            candidates.append(result)
+    for candidate in candidates:
+        for key in ("id", "Id", "registry_id", "RegistryId"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _registry_status_from_response(response: Any) -> str | None:
+    registry = _registry_from_response(response)
+    if registry:
+        for key in ("status", "Status"):
+            value = registry.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(response, dict):
+        result = response.get("Result")
+        if isinstance(result, dict):
+            for key in ("status", "Status"):
+                value = result.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
+def _registry_field_from_response(response: Any, *keys: str) -> Any:
+    registry = _registry_from_response(response)
+    if registry:
+        for key in keys:
+            if key in registry:
+                return registry[key]
+    if isinstance(response, dict):
+        result = response.get("Result")
+        if isinstance(result, dict):
+            for key in keys:
+                if key in result:
+                    return result[key]
+    return None
+
+
+def _first_registry_field(response: Any, *keys: str) -> Any:
+    for key in keys:
+        value = _registry_field_from_response(response, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _registry_nested_field(response: Any, container_keys: tuple[str, ...], *keys: str) -> Any:
     registry = _registry_from_response(response)
     if not registry:
         return None
-    for key in ("id", "Id", "registry_id", "RegistryId"):
-        value = registry.get(key)
+    container = None
+    for container_key in container_keys:
+        value = registry.get(container_key)
+        if isinstance(value, dict):
+            container = value
+            break
+    if not container:
+        return None
+    for key in keys:
+        value = container.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _compact_dict(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if item is not None}
+
+
+def _registry_ui_url(public_address: Any) -> str | None:
+    if not isinstance(public_address, str) or not public_address.strip():
+        return None
+    address = public_address.strip().rstrip("/")
+    parsed = urlparse(address if "://" in address else f"http://{address}")
+    if not parsed.netloc:
+        return None
+    return f"http://{parsed.netloc}/ui"
+
+
+def _registry_create_summary(
+    response: Any,
+    wait_result: dict[str, Any] | None = None,
+    migration_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = _compact_dict(
+        {
+            "id": _registry_id_from_response(response),
+            "request_id": _request_id_from_response(response),
+        }
+    )
+    if wait_result is not None:
+        summary["wait"] = _compact_dict(
+            {
+                "status": wait_result.get("Status"),
+                "ready": wait_result.get("Ready"),
+                "timed_out": wait_result.get("TimedOut"),
+                "attempts": wait_result.get("Attempts"),
+                "request_id": wait_result.get("RequestId"),
+            }
+        )
+    if migration_result is not None:
+        summary["a2a_syncer"] = _compact_dict(
+            {
+                "id": migration_result.get("Id"),
+                "status": migration_result.get("Status"),
+                "ready": migration_result.get("Ready"),
+                "timed_out": migration_result.get("TimedOut"),
+                "attempts": migration_result.get("Attempts"),
+                "request_id": migration_result.get("RequestId"),
+                "message": migration_result.get("Message"),
+            }
+        )
+    return summary
+
+
+def _registry_detail_summary(response: Any, fallback_id: str | None = None) -> dict[str, Any]:
+    public_address = _first_registry_field(response, "public_address", "PublicAddress")
+    return _compact_dict(
+        {
+            "id": _registry_id_from_response(response) or fallback_id,
+            "request_id": _request_id_from_response(response),
+            "status": _registry_status_from_response(response),
+            "public_address": public_address,
+            "private_address": _first_registry_field(
+                response, "private_address", "PrivateAddress"
+            ),
+            "ui_url": _registry_ui_url(public_address),
+            "username": _first_registry_field(
+                response, "username", "Username", "user_name", "UserName"
+            )
+            or "uni",
+            "password": _first_registry_field(
+                response, "initial_password", "InitialPassword", "password", "Password"
+            ),
+        }
+    )
+
+
+def _registry_update_summary(response: Any, fallback_id: str | None = None) -> dict[str, Any]:
+    return _compact_dict(
+        {
+            "id": _registry_id_from_response(response) or fallback_id,
+            "request_id": _request_id_from_response(response),
+            "status": _registry_status_from_response(response),
+            "public_address": _first_registry_field(
+                response, "public_address", "PublicAddress"
+            ),
+            "private_address": _first_registry_field(
+                response, "private_address", "PrivateAddress"
+            ),
+            "acl_entries": _first_registry_field(
+                response, "acl_entries", "AclEntries", "ACLEntries"
+            )
+            or _registry_nested_field(
+                response, ("network_spec", "NetworkSpec"), "acl_entries", "AclEntries"
+            ),
+        }
+    )
+
+
+def _first_result_field(response: Any, *keys: str) -> Any:
+    if not isinstance(response, dict):
+        return None
+    candidates = [response]
+    result = response.get("Result")
+    if isinstance(result, dict):
+        candidates.insert(0, result)
+    for candidate in candidates:
+        for key in keys:
+            if key in candidate:
+                return candidate[key]
+    return None
+
+
+def _registries_from_list_response(response: Any) -> list[dict[str, Any]]:
+    result: Any = response
+    if isinstance(response, dict) and isinstance(response.get("Result"), dict):
+        result = response["Result"]
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if not isinstance(result, dict):
+        return []
+    for key in (
+        "registries",
+        "Registries",
+        "uni_registries",
+        "UniRegistries",
+        "registry_list",
+        "RegistryList",
+        "items",
+        "Items",
+        "list",
+        "List",
+    ):
+        value = result.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _registry_list_summary(response: Any) -> dict[str, Any]:
+    items = [
+        _registry_detail_summary({"Registry": registry})
+        for registry in _registries_from_list_response(response)
+    ]
+    return _compact_dict(
+        {
+            "request_id": _request_id_from_response(response),
+            "page": _first_result_field(
+                response, "page", "Page", "PageNumber", "page_number"
+            ),
+            "page_size": _first_result_field(
+                response, "page_size", "PageSize", "pageSize"
+            ),
+            "total": _first_result_field(
+                response, "total", "Total", "TotalCount", "total_count"
+            ),
+            "items": items,
+        }
+    )
+
+
+def _is_registry_ready_status(status: str | None) -> bool:
+    return (status or "").lower() in {"running", "ready"}
+
+
+def _is_registry_failed_status(status: str | None) -> bool:
+    return (status or "").lower() in {"failed", "error", "abnormal"}
+
+
+def _migration_from_response(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, dict):
+        return None
+    result = response.get("Result", response)
+    if not isinstance(result, dict):
+        return None
+    for key in (
+        "migration",
+        "Migration",
+        "a2a_uni_migration",
+        "A2aUniMigration",
+        "task",
+        "Task",
+    ):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return value
+    return result
+
+
+def _migration_field_from_response(response: Any, *keys: str) -> Any:
+    migration = _migration_from_response(response)
+    if migration:
+        for key in keys:
+            if key in migration:
+                return migration[key]
+    return None
+
+
+def _migration_id_from_response(response: Any) -> str | None:
+    for key in ("id", "Id", "migration_id", "MigrationId", "task_id", "TaskId"):
+        value = _migration_field_from_response(response, key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _migration_status_from_response(response: Any) -> str | None:
+    for key in ("status", "Status", "state", "State"):
+        value = _migration_field_from_response(response, key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _is_migration_ready_status(status: str | None) -> bool:
+    return (status or "").lower() in {
+        "succeeded",
+        "success",
+        "completed",
+        "complete",
+        "finished",
+        "ready",
+    }
+
+
+def _is_migration_failed_status(status: str | None) -> bool:
+    return (status or "").lower() in {
+        "failed",
+        "error",
+        "abnormal",
+        "canceled",
+        "cancelled",
+        "terminated",
+    }
+
+
+def _wait_for_registry_ready(
+    client: UniRegistryClient,
+    resource_id: str,
+    *,
+    interval: float,
+    timeout: float,
+    top: dict[str, Any],
+) -> dict[str, Any]:
+    error_console.print(
+        f"Polling UniRegistry {resource_id}: interval={interval}s timeout={timeout}s"
+    )
+    deadline = time.monotonic() + timeout
+    last_response: Any = None
+    last_status: str | None = None
+    attempts = 0
+    started_at = time.monotonic()
+    while True:
+        attempts += 1
+        last_response = client.get_resource(resource_id, top)
+        last_status = _registry_status_from_response(last_response)
+        request_id = _request_id_from_response(last_response)
+        request_id_text = f" request_id={request_id}" if request_id else ""
+        ready_replicas = _registry_field_from_response(
+            last_response, "ready_replicas", "ReadyReplicas"
+        )
+        replicas = _registry_field_from_response(last_response, "replicas", "Replicas")
+        elapsed = time.monotonic() - started_at
+        if _is_registry_ready_status(last_status):
+            error_console.print(
+                f"Polling UniRegistry {resource_id}: attempt={attempts} "
+                f"status={last_status or 'Unknown'} ready_replicas={ready_replicas} "
+                f"replicas={replicas} elapsed={elapsed:.1f}s result=ready{request_id_text}"
+            )
+            result = {
+                "Status": last_status,
+                "Ready": True,
+                "TimedOut": False,
+                "Attempts": attempts,
+                "GetUniRegistryResponse": last_response,
+            }
+            if request_id:
+                result["RequestId"] = request_id
+            return result
+        if _is_registry_failed_status(last_status):
+            error_console.print(
+                f"Polling UniRegistry {resource_id}: attempt={attempts} "
+                f"status={last_status or 'Unknown'} ready_replicas={ready_replicas} "
+                f"replicas={replicas} elapsed={elapsed:.1f}s result=failed{request_id_text}"
+            )
+            result = {
+                "Status": last_status,
+                "Ready": False,
+                "TimedOut": False,
+                "Attempts": attempts,
+                "GetUniRegistryResponse": last_response,
+            }
+            if request_id:
+                result["RequestId"] = request_id
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error_console.print(
+                f"Polling UniRegistry {resource_id}: attempt={attempts} "
+                f"status={last_status or 'Unknown'} ready_replicas={ready_replicas} "
+                f"replicas={replicas} elapsed={elapsed:.1f}s result=timeout{request_id_text}"
+            )
+            result = {
+                "Status": last_status,
+                "Ready": False,
+                "TimedOut": True,
+                "Attempts": attempts,
+                "GetUniRegistryResponse": last_response,
+            }
+            if request_id:
+                result["RequestId"] = request_id
+            return result
+        sleep_seconds = min(interval, remaining)
+        error_console.print(
+            f"Polling UniRegistry {resource_id}: attempt={attempts} "
+            f"status={last_status or 'Unknown'} ready_replicas={ready_replicas} "
+            f"replicas={replicas} elapsed={elapsed:.1f}s next_poll_in={sleep_seconds:.1f}s"
+            f"{request_id_text}"
+        )
+        time.sleep(sleep_seconds)
+
+
+def _wait_for_a2a_uni_migration(
+    client: UniRegistryClient,
+    migration_id: str,
+    *,
+    interval: float,
+    deadline: float,
+) -> dict[str, Any]:
+    error_console.print(
+        f"Polling A2A Uni migration {migration_id}: interval={interval}s"
+    )
+    last_response: Any = None
+    last_status: str | None = None
+    attempts = 0
+    started_at = time.monotonic()
+    while True:
+        attempts += 1
+        last_response = client.get_a2a_uni_migration(migration_id)
+        last_status = _migration_status_from_response(last_response)
+        request_id = _request_id_from_response(last_response)
+        request_id_text = f" request_id={request_id}" if request_id else ""
+        progress = _migration_field_from_response(last_response, "progress", "Progress")
+        message = _migration_field_from_response(last_response, "message", "Message")
+        elapsed = time.monotonic() - started_at
+        if _is_migration_ready_status(last_status):
+            error_console.print(
+                f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+                f"status={last_status or 'Unknown'} progress={progress} "
+                f"elapsed={elapsed:.1f}s result=ready{request_id_text}"
+            )
+            result = {
+                "Id": migration_id,
+                "Status": last_status,
+                "Ready": True,
+                "TimedOut": False,
+                "Attempts": attempts,
+                "GetA2aUniMigrationResponse": last_response,
+            }
+            if request_id:
+                result["RequestId"] = request_id
+            return result
+        if _is_migration_failed_status(last_status):
+            error_console.print(
+                f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+                f"status={last_status or 'Unknown'} progress={progress} "
+                f"elapsed={elapsed:.1f}s result=failed{request_id_text}"
+            )
+            result = {
+                "Id": migration_id,
+                "Status": last_status,
+                "Ready": False,
+                "TimedOut": False,
+                "Attempts": attempts,
+                "GetA2aUniMigrationResponse": last_response,
+            }
+            if request_id:
+                result["RequestId"] = request_id
+            if isinstance(message, str) and message.strip():
+                result["Message"] = message.strip()
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error_console.print(
+                f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+                f"status={last_status or 'Unknown'} progress={progress} "
+                f"elapsed={elapsed:.1f}s result=timeout{request_id_text}"
+            )
+            result = {
+                "Id": migration_id,
+                "Status": last_status,
+                "Ready": False,
+                "TimedOut": True,
+                "Attempts": attempts,
+                "GetA2aUniMigrationResponse": last_response,
+            }
+            if request_id:
+                result["RequestId"] = request_id
+            return result
+        sleep_seconds = min(interval, remaining)
+        error_console.print(
+            f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+            f"status={last_status or 'Unknown'} progress={progress} "
+            f"elapsed={elapsed:.1f}s next_poll_in={sleep_seconds:.1f}s"
+            f"{request_id_text}"
+        )
+        time.sleep(sleep_seconds)
 
 
 def _registry_from_response(response: Any) -> dict[str, Any] | None:
@@ -486,7 +1041,7 @@ class UniRegistryClient:
             raise UniRegistryAPIError(f"request failed: {exc}") from exc
         if not response.ok:
             raise UniRegistryAPIError(
-                f"HTTP {response.status_code}: {response.text[:1000]}"
+                _format_api_error(response.status_code, response.text)
             )
         if not response.content:
             return {}
@@ -533,6 +1088,22 @@ class UniRegistryClient:
             "POST",
             "/DeleteUniRegistry",
             {"Id": resource_id, **_top_payload(top)},
+        )
+
+    def start_a2a_uni_migration(
+        self, resource_id: str, top: dict[str, Any]
+    ) -> Any:
+        return self.request(
+            "POST",
+            "/StartA2aUniMigration",
+            {"Id": resource_id, **_top_payload(top)},
+        )
+
+    def get_a2a_uni_migration(self, migration_id: str) -> Any:
+        return self.request(
+            "POST",
+            "/GetA2aUniMigration",
+            {"Id": migration_id},
         )
 
     def record_clients(self, registry_id: str) -> list[UniRegistryClient]:
@@ -761,6 +1332,7 @@ def configure_uni_registry(
 
 
 @record_app.command("create")
+@_handle_api_errors
 def create_record(
     ctx: typer.Context,
     registry_id: str | None = typer.Option(None, "--registry-id"),
@@ -806,6 +1378,7 @@ def create_record(
 
 
 @record_app.command("get")
+@_handle_api_errors
 def get_record(
     ctx: typer.Context,
     record_id: str,
@@ -823,6 +1396,7 @@ def get_record(
 
 
 @record_app.command("list")
+@_handle_api_errors
 def list_records(
     ctx: typer.Context,
     registry_id: str | None = typer.Option(None, "--registry-id"),
@@ -854,6 +1428,7 @@ def list_records(
 
 
 @record_app.command("update")
+@_handle_api_errors
 def update_record(
     ctx: typer.Context,
     record_id: str,
@@ -907,6 +1482,7 @@ def update_record(
 
 
 @record_app.command("delete")
+@_handle_api_errors
 def delete_record(
     ctx: typer.Context,
     record_id: str,
@@ -926,6 +1502,7 @@ def delete_record(
 
 
 @registry_app.command("create")
+@_handle_api_errors
 def create_resource(
     ctx: typer.Context,
     name: str | None = typer.Option(None, "--name"),
@@ -942,6 +1519,31 @@ def create_resource(
     json_body: str | None = typer.Option(None, "--json", help="Full request JSON."),
     json_file: str | None = typer.Option(
         None, "--json-file", help="Read full request JSON from a file."
+    ),
+    wait: bool = typer.Option(
+        False,
+        "--wait/--no-wait",
+        help="Poll GetUniRegistry after creation until the instance is ready.",
+    ),
+    wait_interval: float = typer.Option(
+        10.0,
+        "--wait-interval",
+        min=0.1,
+        help="Polling interval in seconds when --wait is enabled.",
+    ),
+    wait_timeout: float = typer.Option(
+        900.0,
+        "--wait-timeout",
+        min=1.0,
+        help="Maximum polling time in seconds when only --wait is enabled.",
+    ),
+    a2a_syncer: bool = typer.Option(
+        False,
+        "--a2a-syncer/--no-a2a-syncer",
+        help=(
+            "After creation, wait for UniRegistry readiness, start A2A Uni "
+            "migration, and poll the migration result. The total timeout is 30 minutes."
+        ),
     ),
 ) -> None:
     """Create a managed UniRegistry resource."""
@@ -968,12 +1570,71 @@ def create_resource(
     if not _has_any_key(payload, "replicas", "Replicas"):
         raise typer.BadParameter("provide --replicas or Replicas/replicas in --json")
     options = _options(ctx)
-    response = _client(options).create_resource(payload)
+    client = _client(options)
+    parsed_top = _json_object(top, "--top")
+    response = client.create_resource(payload)
     _cache_resource_response(response, options)
-    _print(_mask_sensitive(response), options["output"])
+    resource_id = _registry_id_from_response(response)
+    if resource_id:
+        request_id = _request_id_from_response(response)
+        request_id_text = f" request_id={request_id}" if request_id else ""
+        error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
+    migration_result = None
+    if wait or a2a_syncer:
+        if not resource_id:
+            raise UniRegistryAPIError(
+                "CreateUniRegistry response does not include a registry ID to poll"
+            )
+        deadline = time.monotonic() + _A2A_SYNCER_TOTAL_TIMEOUT_SECONDS
+        registry_timeout = (
+            deadline - time.monotonic() if a2a_syncer else wait_timeout
+        )
+        wait_result = _wait_for_registry_ready(
+            client,
+            resource_id,
+            interval=wait_interval,
+            timeout=registry_timeout,
+            top=parsed_top,
+        )
+        final_response = wait_result.get("GetUniRegistryResponse")
+        _cache_resource_response(final_response, options, resource_id)
+        if a2a_syncer:
+            if not wait_result.get("Ready"):
+                raise UniRegistryAPIError(
+                    "UniRegistry did not become ready; skip A2A Uni migration"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UniRegistryAPIError(
+                    "A2A Uni migration was not started because the 30-minute "
+                    "timeout was exhausted while waiting for UniRegistry readiness"
+                )
+            error_console.print(f"Starting A2A Uni migration: registry_id={resource_id}")
+            start_response = client.start_a2a_uni_migration(resource_id, parsed_top)
+            migration_id = _migration_id_from_response(start_response) or resource_id
+            start_request_id = _request_id_from_response(start_response)
+            request_id_text = (
+                f" request_id={start_request_id}" if start_request_id else ""
+            )
+            error_console.print(
+                f"Started A2A Uni migration: id={migration_id}{request_id_text}"
+            )
+            migration_result = _wait_for_a2a_uni_migration(
+                client,
+                migration_id,
+                interval=wait_interval,
+                deadline=deadline,
+            )
+    else:
+        wait_result = None
+    _print(
+        _registry_create_summary(response, wait_result, migration_result),
+        options["output"],
+    )
 
 
 @registry_app.command("get")
+@_handle_api_errors
 def get_resource(
     ctx: typer.Context,
     resource_id: str,
@@ -983,10 +1644,11 @@ def get_resource(
     options = _options(ctx)
     response = _client(options).get_resource(resource_id, _json_object(top, "--top"))
     _cache_resource_response(response, options, resource_id)
-    _print(_mask_sensitive(response), options["output"])
+    _print(_registry_detail_summary(response, resource_id), options["output"])
 
 
 @registry_app.command("list")
+@_handle_api_errors
 def list_resources(
     ctx: typer.Context,
     page: int = typer.Option(1, "--page"),
@@ -1022,10 +1684,12 @@ def list_resources(
     if parsed_top:
         payload["top"] = parsed_top
     options = _options(ctx)
-    _print(_mask_sensitive(_client(options).list_resources(payload)), options["output"])
+    response = _client(options).list_resources(payload)
+    _print(_registry_list_summary(response), options["output"])
 
 
 @registry_app.command("update")
+@_handle_api_errors
 def update_resource(
     ctx: typer.Context,
     resource_id: str,
@@ -1059,10 +1723,11 @@ def update_resource(
     options = _options(ctx)
     response = _client(options).update_resource(payload)
     _cache_resource_response(response, options, resource_id)
-    _print(_mask_sensitive(response), options["output"])
+    _print(_registry_update_summary(response, resource_id), options["output"])
 
 
 @registry_app.command("delete")
+@_handle_api_errors
 def delete_resource(
     ctx: typer.Context,
     resource_id: str,
@@ -1081,6 +1746,7 @@ def delete_resource(
 
 
 @binding_app.command("bind")
+@_handle_api_errors
 def bind_registry(
     ctx: typer.Context,
     registry_id: str,
@@ -1126,6 +1792,7 @@ def bind_registry(
 
 
 @binding_app.command("get")
+@_handle_api_errors
 def get_registry_binding(ctx: typer.Context, registry_id: str) -> None:
     """Show cached connection settings for a registry ID."""
     value = _registry_config(registry_id)
@@ -1135,6 +1802,7 @@ def get_registry_binding(ctx: typer.Context, registry_id: str) -> None:
 
 
 @binding_app.command("list")
+@_handle_api_errors
 def list_registry_bindings(ctx: typer.Context) -> None:
     """List cached registry connection settings."""
     registries = _registry_configs()
@@ -1146,6 +1814,7 @@ def list_registry_bindings(ctx: typer.Context) -> None:
 
 
 @binding_app.command("remove")
+@_handle_api_errors
 def remove_registry_binding(ctx: typer.Context, registry_id: str) -> None:
     """Remove cached connection settings for a registry ID."""
     registries = dict(_registry_configs())

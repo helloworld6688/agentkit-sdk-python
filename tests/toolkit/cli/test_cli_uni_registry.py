@@ -30,11 +30,10 @@ def isolated_uni_registry_config(monkeypatch):
 
 
 class _Response:
-    ok = True
-    status_code = 200
-
-    def __init__(self, payload: dict[str, object] | None = None):
+    def __init__(self, payload: dict[str, object] | None = None, status_code: int = 200):
         self._payload = payload or {}
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
         self.content = json.dumps(self._payload).encode()
         self.text = json.dumps(self._payload)
 
@@ -296,7 +295,26 @@ def test_resource_list_uses_rpc_path_and_signs_request(monkeypatch):
 
     def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
-        return _Response()
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-list"},
+                "Result": {
+                    "PageNumber": 2,
+                    "PageSize": 20,
+                    "Total": 1,
+                    "Registries": [
+                        {
+                            "Id": "ur-1",
+                            "Status": "Running",
+                            "PublicAddress": "115.190.139.100:80",
+                            "PrivateAddress": "192.168.0.10:80",
+                            "InitialPassword": "initial-secret",
+                            "Replicas": 1,
+                        }
+                    ],
+                },
+            }
+        )
 
     monkeypatch.setattr(registry.requests, "request", request)
     monkeypatch.setattr(
@@ -336,6 +354,26 @@ def test_resource_list_uses_rpc_path_and_signs_request(monkeypatch):
         "Filter": {"Id": ["ur-1"], "Status": ["RUNNING"]},
     }
     assert calls[0][2]["headers"]["Authorization"].startswith("HMAC-SHA256 ")
+    output = json.loads(result.output)
+    assert output == {
+        "request_id": "req-list",
+        "page": 2,
+        "page_size": 20,
+        "total": 1,
+        "items": [
+            {
+                "id": "ur-1",
+                "status": "Running",
+                "public_address": "115.190.139.100:80",
+                "private_address": "192.168.0.10:80",
+                "ui_url": "http://115.190.139.100:80/ui",
+                "username": "uni",
+                "password": "initial-secret",
+            }
+        ],
+    }
+    assert "ResponseMetadata" not in result.output
+    assert "Replicas" not in result.output
 
 
 def test_resource_create_accepts_full_json_body(monkeypatch):
@@ -346,7 +384,12 @@ def test_resource_create_accepts_full_json_body(monkeypatch):
 
     def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
-        return _Response({"Result": {"Id": "ur-1"}})
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-create"},
+                "Result": {"Id": "ur-1"},
+            }
+        )
 
     monkeypatch.setattr(registry.requests, "request", request)
     monkeypatch.setattr(
@@ -365,6 +408,8 @@ def test_resource_create_accepts_full_json_body(monkeypatch):
             "uni-reg",
             "--server",
             "https://open.volcengineapi.com",
+            "--service",
+            "agentkit_stg",
             "registry",
             "create",
             "--json",
@@ -384,6 +429,10 @@ def test_resource_create_accepts_full_json_body(monkeypatch):
     )
 
     assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert "Created UniRegistry: id=ur-1 request_id=req-create" in result.output
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output == {"id": "ur-1", "request_id": "req-create"}
     assert calls[0][0:2] == ("POST", "https://open.volcengineapi.com/")
     assert json.loads(calls[0][2]["data"]) == {
         "Name": "uni-public-demo",
@@ -395,6 +444,270 @@ def test_resource_create_accepts_full_json_body(monkeypatch):
             "IpVersion": "IPv4",
         },
     }
+
+
+def test_resource_create_waits_until_registry_running(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+    get_statuses = iter(["Creating", "Running"])
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-create"},
+                    "Result": {"Id": "ur-1"},
+                }
+            )
+        if action == "GetUniRegistry":
+            status = next(get_statuses)
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": f"req-get-{status.lower()}"},
+                    "Result": {
+                        "Registry": {
+                            "Id": "ur-1",
+                            "Status": status,
+                            "PublicAddress": "public.registry.test:80",
+                        }
+                    }
+                }
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://open.volcengineapi.com",
+            "--service",
+            "agentkit_stg",
+            "registry",
+            "create",
+            "--json",
+            json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
+            "--wait",
+            "--wait-interval",
+            "0.1",
+            "--wait-timeout",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [call[1] for call in calls] == ["https://open.volcengineapi.com/"] * 3
+    assert [call[2]["params"]["Action"] for call in calls] == [
+        "CreateUniRegistry",
+        "GetUniRegistry",
+        "GetUniRegistry",
+    ]
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output == {
+        "id": "ur-1",
+        "request_id": "req-create",
+        "wait": {
+            "status": "Running",
+            "ready": True,
+            "timed_out": False,
+            "attempts": 2,
+            "request_id": "req-get-running",
+        },
+    }
+    assert "Created UniRegistry: id=ur-1 request_id=req-create" in result.output
+    assert "Polling UniRegistry ur-1" in result.output
+    assert "request_id=req-get-creating" in result.output
+    assert "request_id=req-get-running" in result.output
+    assert "status=Creating" in result.output
+    assert "status=Running" in result.output
+
+
+def test_resource_create_with_a2a_syncer_waits_and_polls_migration(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+    registry_statuses = iter(["Creating", "Running"])
+    migration_statuses = iter(["Running", "Succeeded"])
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-create"},
+                    "Result": {"Id": "ur-1"},
+                }
+            )
+        if action == "GetUniRegistry":
+            status = next(registry_statuses)
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": f"req-get-{status.lower()}"},
+                    "Result": {"Registry": {"Id": "ur-1", "Status": status}},
+                }
+            )
+        if action == "StartA2aUniMigration":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-start-migration"},
+                    "Result": {"MigrationId": "mig-1"},
+                }
+            )
+        if action == "GetA2aUniMigration":
+            status = next(migration_statuses)
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": f"req-migration-{status.lower()}"},
+                    "Result": {
+                        "Migration": {
+                            "Id": "mig-1",
+                            "Status": status,
+                            "Progress": 100 if status == "Succeeded" else 50,
+                        }
+                    },
+                }
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://open.volcengineapi.com",
+            "--service",
+            "agentkit_stg",
+            "registry",
+            "create",
+            "--json",
+            json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
+            "--a2a-syncer",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [call[2]["params"]["Action"] for call in calls] == [
+        "CreateUniRegistry",
+        "GetUniRegistry",
+        "GetUniRegistry",
+        "StartA2aUniMigration",
+        "GetA2aUniMigration",
+        "GetA2aUniMigration",
+    ]
+    assert json.loads(calls[3][2]["data"]) == {"Id": "ur-1"}
+    assert json.loads(calls[4][2]["data"]) == {"Id": "mig-1"}
+    assert all(
+        "/agentkit_stg/request" in call[2]["headers"]["Authorization"]
+        for call in calls
+    )
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output == {
+        "id": "ur-1",
+        "request_id": "req-create",
+        "wait": {
+            "status": "Running",
+            "ready": True,
+            "timed_out": False,
+            "attempts": 2,
+            "request_id": "req-get-running",
+        },
+        "a2a_syncer": {
+            "id": "mig-1",
+            "status": "Succeeded",
+            "ready": True,
+            "timed_out": False,
+            "attempts": 2,
+            "request_id": "req-migration-succeeded",
+        },
+    }
+    assert "Starting A2A Uni migration: registry_id=ur-1" in result.output
+    assert "Started A2A Uni migration: id=mig-1 request_id=req-start-migration" in result.output
+    assert "Polling A2A Uni migration mig-1" in result.output
+
+
+def test_resource_get_prints_api_error_without_traceback(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    def request(_method, _url, **_kwargs):
+        return _Response(
+            {
+                "ResponseMetadata": {
+                    "RequestId": "req-404",
+                    "Action": "GetUniRegistry",
+                    "Version": "2025-10-30",
+                    "Service": "agentkit_stg",
+                    "Error": {
+                        "HTTPCode": 404,
+                        "Code": "ResourceNotFound.Id",
+                        "Message": "The specified resource Id ur-missing cannot be found.",
+                    },
+                }
+            },
+            status_code=404,
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://open.volcengineapi.com",
+            "registry",
+            "get",
+            "ur-missing",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "cli_uni_registry.py" not in result.output
+    assert "ResourceNotFound.Id" in result.output
+    assert "The specified resource Id ur-missing cannot be found." in result.output
+    assert "request_id=req-404" in result.output
 
 
 def test_resource_list_reads_connection_defaults_from_config(
@@ -611,7 +924,7 @@ def test_resource_list_uses_openapi_action_query_for_byted_endpoint(monkeypatch)
     )
 
 
-def test_registry_get_masks_initial_password_and_skips_unusable_address(
+def test_registry_get_prints_initial_password_and_skips_unusable_address(
     monkeypatch,
 ):
     import agentkit.toolkit.cli.cli_uni_registry as registry
@@ -622,11 +935,15 @@ def test_registry_get_masks_initial_password_and_skips_unusable_address(
         "request",
         lambda *_args, **_kwargs: _Response(
             {
+                "ResponseMetadata": {"RequestId": "req-get"},
                 "Result": {
                     "Registry": {
                         "Id": "ur-1",
+                        "Status": "Running",
                         "PublicAddress": "115.190.137.250:80",
+                        "PrivateAddress": "192.168.0.10:80",
                         "InitialPassword": "should-not-be-printed",
+                        "Replicas": 1,
                     }
                 }
             }
@@ -650,13 +967,88 @@ def test_registry_get_masks_initial_password_and_skips_unusable_address(
     )
 
     assert result.exit_code == 0, result.output
-    assert "should-not-be-printed" not in result.output
-    assert '"InitialPassword": "******"' in result.output
+    output = json.loads(result.output)
+    assert output == {
+        "id": "ur-1",
+        "request_id": "req-get",
+        "status": "Running",
+        "public_address": "115.190.137.250:80",
+        "private_address": "192.168.0.10:80",
+        "ui_url": "http://115.190.137.250:80/ui",
+        "username": "uni",
+        "password": "should-not-be-printed",
+    }
+    assert "Replicas" not in result.output
+    assert "ResponseMetadata" not in result.output
     assert registry._registry_config("ur-1") == {
         "username": "admin",
         "password": "secret",
         "service": "agentkit",
     }
+
+
+def test_resource_update_prints_compact_registry_summary(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-update"},
+                "Result": {
+                    "Registry": {
+                        "Id": "ur-1",
+                        "Status": "Running",
+                        "PublicAddress": "115.190.137.250:80",
+                        "PrivateAddress": "192.168.0.10:80",
+                        "InitialPassword": "password-not-in-update-summary",
+                        "NetworkSpec": {"AclEntries": ["203.0.113.10/32"]},
+                        "Replicas": 1,
+                    }
+                },
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://control.test",
+            "registry",
+            "update",
+            "ur-1",
+            "--json",
+            '{"NetworkSpec":{"NetworkType":["PUBLIC"],"AclEntries":["203.0.113.10/32"]}}',
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = json.loads(result.output)
+    assert output == {
+        "id": "ur-1",
+        "request_id": "req-update",
+        "status": "Running",
+        "public_address": "115.190.137.250:80",
+        "private_address": "192.168.0.10:80",
+        "acl_entries": ["203.0.113.10/32"],
+    }
+    assert "password-not-in-update-summary" not in result.output
+    assert "ResponseMetadata" not in result.output
 
 
 def test_search_set_create_then_provisions_mcp_and_reads_toolset(monkeypatch):
