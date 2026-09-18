@@ -258,13 +258,33 @@ def _default_registry_id() -> str | None:
     return resolved or None
 
 
-def _resolve_registry_id(registry_id: str | None) -> str:
+def _resolve_registry_id(
+    registry_id: str | None, *, source_label: str = "--registry-id"
+) -> str:
     resolved = (registry_id or _default_registry_id() or "").strip()
     if not resolved:
         raise typer.BadParameter(
-            "provide --registry-id or set uni_registry.defaults.registry_id"
+            f"provide {source_label} or set uni_registry.defaults.registry_id"
         )
     return resolved
+
+
+def _set_default_registry_id(registry_id: str) -> None:
+    normalized_id = registry_id.strip()
+    if not normalized_id:
+        return
+    data = read_global_config_dict(force_reload=True)
+    section = data.setdefault("uni_registry", {})
+    if not isinstance(section, dict):
+        section = {}
+        data["uni_registry"] = section
+    defaults = section.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        section["defaults"] = defaults
+    defaults["registry_id"] = normalized_id
+    section["default_registry_id"] = normalized_id
+    write_global_config_dict(data)
 
 
 def _registry_configs(force_reload: bool = False) -> dict[str, dict[str, Any]]:
@@ -754,6 +774,8 @@ def _wait_for_a2a_uni_migration(
     client: UniRegistryClient,
     migration_id: str,
     *,
+    registry_id: str | None = None,
+    with_id: bool = False,
     interval: float,
     deadline: float,
 ) -> dict[str, Any]:
@@ -766,7 +788,9 @@ def _wait_for_a2a_uni_migration(
     started_at = time.monotonic()
     while True:
         attempts += 1
-        last_response = client.get_a2a_uni_migration(migration_id)
+        last_response = client.get_a2a_uni_migration(
+            migration_id, registry_id=registry_id, with_id=with_id
+        )
         last_status = _migration_status_from_response(last_response)
         request_id = _request_id_from_response(last_response)
         request_id_text = f" request_id={request_id}" if request_id else ""
@@ -854,6 +878,10 @@ def _top_payload(top: dict[str, Any]) -> dict[str, Any]:
     return {"Top": top} if top else {}
 
 
+def _uni_registry_id_header(resource_id: str) -> dict[str, str]:
+    return {"X-Mse-Uni-Registry-Id": resource_id}
+
+
 def _resource_payload(payload: dict[str, Any]) -> dict[str, Any]:
     field_names = {
         "id": "Id",
@@ -929,7 +957,12 @@ class UniRegistryClient:
         self.region = self.region or endpoint.region
 
     def _signed_headers(
-        self, method: str, path: str, params: dict[str, Any], body: str
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any],
+        body: str,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, str]:
         if not self.access_key or not self.secret_key:
             raise UniRegistryAPIError("Volcengine credentials are required")
@@ -949,7 +982,17 @@ class UniRegistryClient:
             "X-Date": timestamp,
             "X-Content-Sha256": payload_hash,
         }
+        if extra_headers:
+            headers.update(extra_headers)
         signed_names = ["content-type", "host", "x-content-sha256", "x-date"]
+        if extra_headers:
+            signed_names.extend(
+                sorted(
+                    name.lower()
+                    for name in extra_headers
+                    if name.lower() not in signed_names
+                )
+            )
         if self.session_token:
             headers["X-Security-Token"] = self.session_token
             signed_names.append("x-security-token")
@@ -999,6 +1042,7 @@ class UniRegistryClient:
         path: str,
         body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""
         query = params or {}
@@ -1014,20 +1058,24 @@ class UniRegistryClient:
                 **query,
             }
             request_path = "/"
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        request_headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if headers:
+            request_headers.update(headers)
         auth = None
         if self.username or self.password:
             auth = (self.username, self.password)
         elif not path.startswith("/api/v1/"):
             self._load_credentials()
-            headers = self._signed_headers(method, request_path, query, body_text)
+            request_headers = self._signed_headers(
+                method, request_path, query, body_text, headers
+            )
         try:
             response = requests.request(
                 method,
                 f"{self.server}{request_path}",
                 params=query,
                 data=body_text or None,
-                headers=headers,
+                headers=request_headers,
                 auth=auth,
                 timeout=self.timeout,
             )
@@ -1091,19 +1139,29 @@ class UniRegistryClient:
         )
 
     def start_a2a_uni_migration(
-        self, resource_id: str, top: dict[str, Any]
+        self, resource_id: str, top: dict[str, Any], *, with_id: bool = False
     ) -> Any:
+        headers = _uni_registry_id_header(resource_id) if with_id else None
         return self.request(
             "POST",
             "/StartA2aUniMigration",
             {"Id": resource_id, **_top_payload(top)},
+            headers=headers,
         )
 
-    def get_a2a_uni_migration(self, migration_id: str) -> Any:
+    def get_a2a_uni_migration(
+        self,
+        migration_id: str,
+        *,
+        registry_id: str | None = None,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
         return self.request(
             "POST",
             "/GetA2aUniMigration",
             {"Id": migration_id},
+            headers=headers,
         )
 
     def record_clients(self, registry_id: str) -> list[UniRegistryClient]:
@@ -1545,6 +1603,14 @@ def create_resource(
             "migration, and poll the migration result. The total timeout is 30 minutes."
         ),
     ),
+    with_id: bool = typer.Option(
+        False,
+        "--with-id/--no-with-id",
+        help=(
+            "Add X-Mse-Uni-Registry-Id with the created UniRegistry ID to "
+            "A2A Uni migration requests."
+        ),
+    ),
 ) -> None:
     """Create a managed UniRegistry resource."""
     payload = _json_request(json_body, json_file)
@@ -1579,6 +1645,8 @@ def create_resource(
         request_id = _request_id_from_response(response)
         request_id_text = f" request_id={request_id}" if request_id else ""
         error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
+        _set_default_registry_id(resource_id)
+        error_console.print(f"Set default UniRegistry id: {resource_id}")
     migration_result = None
     if wait or a2a_syncer:
         if not resource_id:
@@ -1610,7 +1678,9 @@ def create_resource(
                     "timeout was exhausted while waiting for UniRegistry readiness"
                 )
             error_console.print(f"Starting A2A Uni migration: registry_id={resource_id}")
-            start_response = client.start_a2a_uni_migration(resource_id, parsed_top)
+            start_response = client.start_a2a_uni_migration(
+                resource_id, parsed_top, with_id=with_id
+            )
             migration_id = _migration_id_from_response(start_response) or resource_id
             start_request_id = _request_id_from_response(start_response)
             request_id_text = (
@@ -1622,6 +1692,8 @@ def create_resource(
             migration_result = _wait_for_a2a_uni_migration(
                 client,
                 migration_id,
+                registry_id=resource_id,
+                with_id=with_id,
                 interval=wait_interval,
                 deadline=deadline,
             )
@@ -1637,14 +1709,20 @@ def create_resource(
 @_handle_api_errors
 def get_resource(
     ctx: typer.Context,
-    resource_id: str,
+    resource_id: str | None = typer.Argument(
+        None,
+        help="UniRegistry ID. Defaults to uni_registry.defaults.registry_id.",
+    ),
     top: str | None = typer.Option(None, "--top"),
 ) -> None:
     """Get a managed UniRegistry resource."""
     options = _options(ctx)
-    response = _client(options).get_resource(resource_id, _json_object(top, "--top"))
-    _cache_resource_response(response, options, resource_id)
-    _print(_registry_detail_summary(response, resource_id), options["output"])
+    resolved_resource_id = _resolve_registry_id(resource_id, source_label="RESOURCE_ID")
+    response = _client(options).get_resource(
+        resolved_resource_id, _json_object(top, "--top")
+    )
+    _cache_resource_response(response, options, resolved_resource_id)
+    _print(_registry_detail_summary(response, resolved_resource_id), options["output"])
 
 
 @registry_app.command("list")

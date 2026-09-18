@@ -376,7 +376,9 @@ def test_resource_list_uses_rpc_path_and_signs_request(monkeypatch):
     assert "Replicas" not in result.output
 
 
-def test_resource_create_accepts_full_json_body(monkeypatch):
+def test_resource_create_accepts_full_json_body(
+    monkeypatch, isolated_uni_registry_config
+):
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
 
@@ -433,6 +435,8 @@ def test_resource_create_accepts_full_json_body(monkeypatch):
     assert "Created UniRegistry: id=ur-1 request_id=req-create" in result.output
     output = json.loads(result.output[result.output.index("{") :])
     assert output == {"id": "ur-1", "request_id": "req-create"}
+    assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-1"
+    assert isolated_uni_registry_config["uni_registry"]["default_registry_id"] == "ur-1"
     assert calls[0][0:2] == ("POST", "https://open.volcengineapi.com/")
     assert json.loads(calls[0][2]["data"]) == {
         "Name": "uni-public-demo",
@@ -612,6 +616,7 @@ def test_resource_create_with_a2a_syncer_waits_and_polls_migration(monkeypatch):
             "--json",
             json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
             "--a2a-syncer",
+            "--with-id",
             "--wait-interval",
             "0.1",
         ],
@@ -628,6 +633,15 @@ def test_resource_create_with_a2a_syncer_waits_and_polls_migration(monkeypatch):
     ]
     assert json.loads(calls[3][2]["data"]) == {"Id": "ur-1"}
     assert json.loads(calls[4][2]["data"]) == {"Id": "mig-1"}
+    assert all("X-Mse-Uni-Registry-Id" not in call[2]["headers"] for call in calls[:3])
+    assert all(
+        call[2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-1"
+        for call in calls[3:]
+    )
+    assert all(
+        "x-mse-uni-registry-id" in call[2]["headers"]["Authorization"]
+        for call in calls[3:]
+    )
     assert all(
         "/agentkit_stg/request" in call[2]["headers"]["Authorization"]
         for call in calls
@@ -708,6 +722,61 @@ def test_resource_get_prints_api_error_without_traceback(monkeypatch):
     assert "ResourceNotFound.Id" in result.output
     assert "The specified resource Id ur-missing cannot be found." in result.output
     assert "request_id=req-404" in result.output
+
+
+def test_resource_get_uses_default_registry_id_from_config(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-get"},
+                "Result": {
+                    "Registry": {
+                        "Id": "ur-default",
+                        "Status": "Running",
+                        "PublicAddress": "public.registry.test:80",
+                    }
+                },
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(app, ["uni-reg", "registry", "get"])
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "GetUniRegistry"
+    assert json.loads(calls[0][2]["data"]) == {"Id": "ur-default"}
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output["id"] == "ur-default"
+    assert output["status"] == "Running"
 
 
 def test_resource_list_reads_connection_defaults_from_config(
