@@ -542,13 +542,124 @@ def test_resource_create_waits_until_registry_running(monkeypatch):
     assert "status=Running" in result.output
 
 
-def test_resource_create_with_a2a_syncer_waits_and_polls_migration(monkeypatch):
+def test_resource_create_help_does_not_include_syncer_options():
+    from agentkit.toolkit.cli.cli import app
+
+    result = runner.invoke(app, ["uni-reg", "registry", "create", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--a2a-syncer" not in result.output
+    assert "--skill-syncer" not in result.output
+    assert "--syncer" not in result.output
+    assert "--workspace-id" not in result.output
+
+
+def test_resource_syncer_uses_existing_default_and_requested_type(
+    monkeypatch, isolated_uni_registry_config
+):
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
 
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
     calls = []
-    registry_statuses = iter(["Creating", "Running"])
-    migration_statuses = iter(["Running", "Succeeded"])
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "GetUniRegistry":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-get"},
+                    "Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}},
+                }
+            )
+        if action == "StartA2aUniMigration":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-start-a2a"},
+                    "Result": {"MigrationId": "mig-a2a"},
+                }
+            )
+        if action == "GetA2aUniMigration":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-get-a2a"},
+                    "Result": {
+                        "Migration": {
+                            "Id": "mig-a2a",
+                            "Status": "Succeeded",
+                            "Progress": 100,
+                        }
+                    },
+                }
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [call[2]["params"]["Action"] for call in calls] == [
+        "GetUniRegistry",
+        "StartA2aUniMigration",
+        "GetA2aUniMigration",
+    ]
+    assert json.loads(calls[0][2]["data"]) == {"Id": "ur-default"}
+    assert json.loads(calls[1][2]["data"]) == {"Id": "ur-ready"}
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output["id"] == "ur-default"
+    assert output["created"] is False
+    assert output["a2a_syncer"]["id"] == "mig-a2a"
+    assert "skill_syncer" not in output
+
+
+def test_resource_syncer_creates_when_no_default_and_runs_both(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
 
     def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
@@ -561,45 +672,34 @@ def test_resource_create_with_a2a_syncer_waits_and_polls_migration(monkeypatch):
                 }
             )
         if action == "GetUniRegistry":
-            status = next(registry_statuses)
             return _Response(
                 {
-                    "ResponseMetadata": {"RequestId": f"req-get-{status.lower()}"},
-                    "Result": {"Registry": {"Id": "ur-1", "Status": status}},
+                    "ResponseMetadata": {"RequestId": "req-get"},
+                    "Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}},
                 }
             )
         if action == "StartA2aUniMigration":
-            return _Response(
-                {
-                    "ResponseMetadata": {"RequestId": "req-start-migration"},
-                    "Result": {"MigrationId": "mig-1"},
-                }
-            )
+            return _Response({"Result": {"MigrationId": "mig-a2a"}})
         if action == "GetA2aUniMigration":
-            status = next(migration_statuses)
             return _Response(
-                {
-                    "ResponseMetadata": {"RequestId": f"req-migration-{status.lower()}"},
-                    "Result": {
-                        "Migration": {
-                            "Id": "mig-1",
-                            "Status": status,
-                            "Progress": 100 if status == "Succeeded" else 50,
-                        }
-                    },
-                }
+                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
+            )
+        if action == "StartSkillUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-skill"}})
+        if action == "GetSkillUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-skill", "Status": "Succeeded"}}}
             )
         return _Response()
 
     monkeypatch.setattr(registry.requests, "request", request)
-    monkeypatch.setattr(registry.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "abc123ef")
     monkeypatch.setattr(
         registry.UniRegistryClient,
         "_load_credentials",
         lambda self: (
             setattr(self, "access_key", "ak"),
             setattr(self, "secret_key", "sk"),
-            setattr(self, "region", "cn-beijing"),
         ),
     )
 
@@ -607,16 +707,12 @@ def test_resource_create_with_a2a_syncer_waits_and_polls_migration(monkeypatch):
         app,
         [
             "uni-reg",
-            "--server",
-            "https://open.volcengineapi.com",
-            "--service",
-            "agentkit_stg",
             "registry",
-            "create",
-            "--json",
-            json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
-            "--a2a-syncer",
-            "--with-id",
+            "syncer",
+            "--gateway-id",
+            "g-1",
+            "--workspace-id",
+            "ws-1",
             "--wait-interval",
             "0.1",
         ],
@@ -626,49 +722,434 @@ def test_resource_create_with_a2a_syncer_waits_and_polls_migration(monkeypatch):
     assert [call[2]["params"]["Action"] for call in calls] == [
         "CreateUniRegistry",
         "GetUniRegistry",
-        "GetUniRegistry",
         "StartA2aUniMigration",
         "GetA2aUniMigration",
-        "GetA2aUniMigration",
+        "StartSkillUniMigration",
+        "GetSkillUniMigration",
     ]
-    assert json.loads(calls[3][2]["data"]) == {"Id": "ur-1"}
-    assert json.loads(calls[4][2]["data"]) == {"Id": "mig-1"}
-    assert all("X-Mse-Uni-Registry-Id" not in call[2]["headers"] for call in calls[:3])
-    assert all(
-        call[2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-1"
-        for call in calls[3:]
-    )
-    assert all(
-        "x-mse-uni-registry-id" in call[2]["headers"]["Authorization"]
-        for call in calls[3:]
-    )
-    assert all(
-        "/agentkit_stg/request" in call[2]["headers"]["Authorization"]
-        for call in calls
-    )
-    output = json.loads(result.output[result.output.index("{") :])
-    assert output == {
-        "id": "ur-1",
-        "request_id": "req-create",
-        "wait": {
-            "status": "Running",
-            "ready": True,
-            "timed_out": False,
-            "attempts": 2,
-            "request_id": "req-get-running",
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "registry-abc123ef",
+        "Replicas": 2,
+        "DeletionProtectionEnabled": False,
+        "NetworkSpec": {
+            "NetworkType": ["PUBLIC"],
+            "EipBandwidth": 1,
+            "IpVersion": "IPv4",
         },
-        "a2a_syncer": {
-            "id": "mig-1",
-            "status": "Succeeded",
-            "ready": True,
-            "timed_out": False,
-            "attempts": 2,
-            "request_id": "req-migration-succeeded",
-        },
+        "GatewayId": "g-1",
     }
-    assert "Starting A2A Uni migration: registry_id=ur-1" in result.output
-    assert "Started A2A Uni migration: id=mig-1 request_id=req-start-migration" in result.output
-    assert "Polling A2A Uni migration mig-1" in result.output
+    assert json.loads(calls[4][2]["data"]) == {
+        "Id": "ur-ready",
+        "WorkspaceId": "ws-1",
+    }
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output["id"] == "ur-1"
+    assert output["created"] is True
+    assert output["a2a_syncer"]["id"] == "mig-a2a"
+    assert output["skill_syncer"]["id"] == "mig-skill"
+    assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-1"
+
+
+def test_resource_syncer_create_defaults_gateway_id_to_empty_string(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response({"Result": {"Id": "ur-1"}})
+        if action == "GetUniRegistry":
+            return _Response(
+                {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
+            )
+        if action == "StartA2aUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-a2a"}})
+        if action == "GetA2aUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "def456ab")
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "registry-def456ab",
+        "Replicas": 2,
+        "DeletionProtectionEnabled": False,
+        "NetworkSpec": {
+            "NetworkType": ["PUBLIC"],
+            "EipBandwidth": 1,
+            "IpVersion": "IPv4",
+        },
+        "GatewayId": "",
+    }
+
+
+def test_resource_start_a2a_migration_uses_default_registry_id(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-start"},
+                "Result": {"MigrationId": "mig-1", "Status": "Running"},
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(app, ["uni-reg", "registry", "start-a2a-migration"])
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "StartA2aUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {"Id": "ur-default"}
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
+    output = json.loads(result.output)
+    assert output == {
+        "id": "mig-1",
+        "registry_id": "ur-default",
+        "request_id": "req-start",
+        "status": "Running",
+    }
+
+
+def test_resource_get_a2a_migration_uses_migration_id_and_registry_header(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-get-migration"},
+                "Result": {
+                    "Migration": {
+                        "Id": "mig-1",
+                        "Status": "Succeeded",
+                        "Progress": 100,
+                    }
+                },
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "get-a2a-migration",
+            "mig-1",
+            "--registry-id",
+            "ur-explicit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "GetA2aUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {"Id": "mig-1"}
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-explicit"
+    output = json.loads(result.output)
+    assert output == {
+        "id": "mig-1",
+        "registry_id": "ur-explicit",
+        "request_id": "req-get-migration",
+        "status": "Succeeded",
+        "progress": 100,
+    }
+
+    calls.clear()
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "get-a2a-migration",
+            "--registry-id",
+            "ur-explicit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {"Id": "ur-explicit"}
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-explicit"
+
+
+def test_resource_skill_migration_commands_use_registry_id_header(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "StartSkillUniMigration":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-start-skill"},
+                    "Result": {"MigrationId": "mig-skill", "Status": "Running"},
+                }
+            )
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-get-skill"},
+                "Result": {
+                    "Migration": {
+                        "Id": "mig-skill",
+                        "Status": "Succeeded",
+                        "Progress": 100,
+                    }
+                },
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "start-skill-migration",
+            "--workspace-id",
+            "ws-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "StartSkillUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {
+        "Id": "ur-default",
+        "WorkspaceId": "ws-1",
+    }
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
+    output = json.loads(result.output)
+    assert output["id"] == "mig-skill"
+    assert output["registry_id"] == "ur-default"
+
+    calls.clear()
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "get-skill-migration",
+            "mig-skill",
+            "--registry-id",
+            "ur-explicit",
+            "--workspace-id",
+            "ws-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "GetSkillUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {
+        "Id": "mig-skill",
+        "WorkspaceId": "ws-1",
+    }
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-explicit"
+    output = json.loads(result.output)
+    assert output["id"] == "mig-skill"
+    assert output["registry_id"] == "ur-explicit"
+    assert output["status"] == "Succeeded"
+
+
+def test_resource_retry_migration_commands_include_version_and_workspace(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": f"req-{action}"},
+                "Result": {"MigrationId": "mig-retry", "Status": "Running"},
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "retry-a2a-migration",
+            "mig-a2a",
+            "--version",
+            "7",
+            "--registry-id",
+            "ur-explicit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "RetryA2aUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {"Id": "mig-a2a", "Version": 7}
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-explicit"
+
+    calls.clear()
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "retry-skill-migration",
+            "mig-skill",
+            "--version",
+            "8",
+            "--workspace-id",
+            "ws-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "RetrySkillUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {
+        "Id": "mig-skill",
+        "WorkspaceId": "ws-1",
+        "Version": 8,
+    }
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
 
 
 def test_resource_get_prints_api_error_without_traceback(monkeypatch):
@@ -774,6 +1255,7 @@ def test_resource_get_uses_default_registry_id_from_config(
     assert result.exit_code == 0, result.output
     assert calls[0][2]["params"]["Action"] == "GetUniRegistry"
     assert json.loads(calls[0][2]["data"]) == {"Id": "ur-default"}
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
     output = json.loads(result.output[result.output.index("{") :])
     assert output["id"] == "ur-default"
     assert output["status"] == "Running"
@@ -1107,6 +1589,7 @@ def test_resource_update_prints_compact_registry_summary(monkeypatch):
     )
 
     assert result.exit_code == 0, result.output
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-1"
     output = json.loads(result.output)
     assert output == {
         "id": "ur-1",
@@ -1118,6 +1601,45 @@ def test_resource_update_prints_compact_registry_summary(monkeypatch):
     }
     assert "password-not-in-update-summary" not in result.output
     assert "ResponseMetadata" not in result.output
+
+
+def test_resource_delete_adds_registry_id_header(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"ResponseMetadata": {"RequestId": "req-delete"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://control.test",
+            "registry",
+            "delete",
+            "ur-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:2] == ("POST", "https://control.test/DeleteUniRegistry")
+    assert json.loads(calls[0][2]["data"]) == {"Id": "ur-1"}
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-1"
 
 
 def test_search_set_create_then_provisions_mcp_and_reads_toolset(monkeypatch):

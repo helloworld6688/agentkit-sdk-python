@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -470,6 +471,7 @@ def _registry_create_summary(
     response: Any,
     wait_result: dict[str, Any] | None = None,
     migration_result: dict[str, Any] | None = None,
+    skill_migration_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary = _compact_dict(
         {
@@ -497,6 +499,18 @@ def _registry_create_summary(
                 "attempts": migration_result.get("Attempts"),
                 "request_id": migration_result.get("RequestId"),
                 "message": migration_result.get("Message"),
+            }
+        )
+    if skill_migration_result is not None:
+        summary["skill_syncer"] = _compact_dict(
+            {
+                "id": skill_migration_result.get("Id"),
+                "status": skill_migration_result.get("Status"),
+                "ready": skill_migration_result.get("Ready"),
+                "timed_out": skill_migration_result.get("TimedOut"),
+                "attempts": skill_migration_result.get("Attempts"),
+                "request_id": skill_migration_result.get("RequestId"),
+                "message": skill_migration_result.get("Message"),
             }
         )
     return summary
@@ -543,6 +557,77 @@ def _registry_update_summary(response: Any, fallback_id: str | None = None) -> d
             or _registry_nested_field(
                 response, ("network_spec", "NetworkSpec"), "acl_entries", "AclEntries"
             ),
+        }
+    )
+
+
+def _registry_syncer_summary(
+    *,
+    registry_id: str,
+    created: bool,
+    create_response: Any | None,
+    wait_result: dict[str, Any] | None,
+    migration_result: dict[str, Any] | None = None,
+    skill_migration_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = _compact_dict(
+        {
+            "id": registry_id,
+            "created": created,
+            "request_id": _request_id_from_response(create_response),
+        }
+    )
+    if wait_result is not None:
+        summary["wait"] = _compact_dict(
+            {
+                "status": wait_result.get("Status"),
+                "ready": wait_result.get("Ready"),
+                "timed_out": wait_result.get("TimedOut"),
+                "attempts": wait_result.get("Attempts"),
+                "request_id": wait_result.get("RequestId"),
+            }
+        )
+    if migration_result is not None:
+        summary["a2a_syncer"] = _compact_dict(
+            {
+                "id": migration_result.get("Id"),
+                "status": migration_result.get("Status"),
+                "ready": migration_result.get("Ready"),
+                "timed_out": migration_result.get("TimedOut"),
+                "attempts": migration_result.get("Attempts"),
+                "request_id": migration_result.get("RequestId"),
+                "message": migration_result.get("Message"),
+            }
+        )
+    if skill_migration_result is not None:
+        summary["skill_syncer"] = _compact_dict(
+            {
+                "id": skill_migration_result.get("Id"),
+                "status": skill_migration_result.get("Status"),
+                "ready": skill_migration_result.get("Ready"),
+                "timed_out": skill_migration_result.get("TimedOut"),
+                "attempts": skill_migration_result.get("Attempts"),
+                "request_id": skill_migration_result.get("RequestId"),
+                "message": skill_migration_result.get("Message"),
+            }
+        )
+    return summary
+
+
+def _uni_migration_summary(
+    response: Any,
+    *,
+    fallback_id: str | None = None,
+    registry_id: str | None = None,
+) -> dict[str, Any]:
+    return _compact_dict(
+        {
+            "id": _migration_id_from_response(response) or fallback_id,
+            "registry_id": registry_id,
+            "request_id": _request_id_from_response(response),
+            "status": _migration_status_from_response(response),
+            "progress": _migration_field_from_response(response, "progress", "Progress"),
+            "message": _migration_field_from_response(response, "message", "Message"),
         }
     )
 
@@ -770,26 +855,30 @@ def _wait_for_registry_ready(
         time.sleep(sleep_seconds)
 
 
-def _wait_for_a2a_uni_migration(
-    client: UniRegistryClient,
+def _wait_for_uni_migration(
     migration_id: str,
     *,
+    label: str,
+    response_key: str,
+    get_migration: Any,
     registry_id: str | None = None,
     with_id: bool = False,
+    get_kwargs: dict[str, Any] | None = None,
     interval: float,
     deadline: float,
 ) -> dict[str, Any]:
-    error_console.print(
-        f"Polling A2A Uni migration {migration_id}: interval={interval}s"
-    )
+    error_console.print(f"Polling {label} {migration_id}: interval={interval}s")
     last_response: Any = None
     last_status: str | None = None
     attempts = 0
     started_at = time.monotonic()
     while True:
         attempts += 1
-        last_response = client.get_a2a_uni_migration(
-            migration_id, registry_id=registry_id, with_id=with_id
+        last_response = get_migration(
+            migration_id,
+            registry_id=registry_id,
+            with_id=with_id,
+            **(get_kwargs or {}),
         )
         last_status = _migration_status_from_response(last_response)
         request_id = _request_id_from_response(last_response)
@@ -799,7 +888,7 @@ def _wait_for_a2a_uni_migration(
         elapsed = time.monotonic() - started_at
         if _is_migration_ready_status(last_status):
             error_console.print(
-                f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+                f"Polling {label} {migration_id}: attempt={attempts} "
                 f"status={last_status or 'Unknown'} progress={progress} "
                 f"elapsed={elapsed:.1f}s result=ready{request_id_text}"
             )
@@ -809,14 +898,14 @@ def _wait_for_a2a_uni_migration(
                 "Ready": True,
                 "TimedOut": False,
                 "Attempts": attempts,
-                "GetA2aUniMigrationResponse": last_response,
+                response_key: last_response,
             }
             if request_id:
                 result["RequestId"] = request_id
             return result
         if _is_migration_failed_status(last_status):
             error_console.print(
-                f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+                f"Polling {label} {migration_id}: attempt={attempts} "
                 f"status={last_status or 'Unknown'} progress={progress} "
                 f"elapsed={elapsed:.1f}s result=failed{request_id_text}"
             )
@@ -826,7 +915,7 @@ def _wait_for_a2a_uni_migration(
                 "Ready": False,
                 "TimedOut": False,
                 "Attempts": attempts,
-                "GetA2aUniMigrationResponse": last_response,
+                response_key: last_response,
             }
             if request_id:
                 result["RequestId"] = request_id
@@ -836,7 +925,7 @@ def _wait_for_a2a_uni_migration(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             error_console.print(
-                f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+                f"Polling {label} {migration_id}: attempt={attempts} "
                 f"status={last_status or 'Unknown'} progress={progress} "
                 f"elapsed={elapsed:.1f}s result=timeout{request_id_text}"
             )
@@ -846,19 +935,101 @@ def _wait_for_a2a_uni_migration(
                 "Ready": False,
                 "TimedOut": True,
                 "Attempts": attempts,
-                "GetA2aUniMigrationResponse": last_response,
+                response_key: last_response,
             }
             if request_id:
                 result["RequestId"] = request_id
             return result
         sleep_seconds = min(interval, remaining)
         error_console.print(
-            f"Polling A2A Uni migration {migration_id}: attempt={attempts} "
+            f"Polling {label} {migration_id}: attempt={attempts} "
             f"status={last_status or 'Unknown'} progress={progress} "
             f"elapsed={elapsed:.1f}s next_poll_in={sleep_seconds:.1f}s"
             f"{request_id_text}"
         )
         time.sleep(sleep_seconds)
+
+
+def _wait_for_a2a_uni_migration(
+    client: UniRegistryClient,
+    migration_id: str,
+    *,
+    registry_id: str | None = None,
+    with_id: bool = False,
+    interval: float,
+    deadline: float,
+) -> dict[str, Any]:
+    return _wait_for_uni_migration(
+        migration_id,
+        label="A2A Uni migration",
+        response_key="GetA2aUniMigrationResponse",
+        get_migration=client.get_a2a_uni_migration,
+        registry_id=registry_id,
+        with_id=with_id,
+        interval=interval,
+        deadline=deadline,
+    )
+
+
+def _wait_for_skill_uni_migration(
+    client: UniRegistryClient,
+    migration_id: str,
+    *,
+    workspace_id: str,
+    registry_id: str | None = None,
+    with_id: bool = False,
+    interval: float,
+    deadline: float,
+) -> dict[str, Any]:
+    return _wait_for_uni_migration(
+        migration_id,
+        label="Skill Uni migration",
+        response_key="GetSkillUniMigrationResponse",
+        get_migration=client.get_skill_uni_migration,
+        registry_id=registry_id,
+        with_id=with_id,
+        get_kwargs={"workspace_id": workspace_id},
+        interval=interval,
+        deadline=deadline,
+    )
+
+
+def _start_and_wait_uni_migration(
+    client: UniRegistryClient,
+    *,
+    label: str,
+    registry_id: str,
+    top: dict[str, Any],
+    start_migration: Any,
+    wait_migration: Any,
+    start_kwargs: dict[str, Any] | None = None,
+    wait_kwargs: dict[str, Any] | None = None,
+    interval: float,
+    deadline: float,
+) -> dict[str, Any]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise UniRegistryAPIError(
+            f"{label} was not started because the timeout was exhausted "
+            "while waiting for UniRegistry readiness"
+        )
+    error_console.print(f"Starting {label}: registry_id={registry_id}")
+    start_response = start_migration(
+        registry_id, top, with_id=True, **(start_kwargs or {})
+    )
+    migration_id = _migration_id_from_response(start_response) or registry_id
+    start_request_id = _request_id_from_response(start_response)
+    request_id_text = f" request_id={start_request_id}" if start_request_id else ""
+    error_console.print(f"Started {label}: id={migration_id}{request_id_text}")
+    return wait_migration(
+        client,
+        migration_id,
+        registry_id=registry_id,
+        with_id=True,
+        **(wait_kwargs or {}),
+        interval=interval,
+        deadline=deadline,
+    )
 
 
 def _registry_from_response(response: Any) -> dict[str, Any] | None:
@@ -880,6 +1051,32 @@ def _top_payload(top: dict[str, Any]) -> dict[str, Any]:
 
 def _uni_registry_id_header(resource_id: str) -> dict[str, str]:
     return {"X-Mse-Uni-Registry-Id": resource_id}
+
+
+def _uni_test_suffix_header() -> dict[str, str]:
+    return {"X-Mse-Uni-Test-Suffix": "test"}
+
+
+def _default_syncer_create_payload(gateway_id: str | None) -> dict[str, Any]:
+    return {
+        "Name": f"registry-{secrets.token_hex(4)}",
+        "Replicas": 2,
+        "DeletionProtectionEnabled": False,
+        "NetworkSpec": {
+            "NetworkType": ["PUBLIC"],
+            "EipBandwidth": 1,
+            "IpVersion": "IPv4",
+        },
+        "GatewayId": gateway_id or "",
+    }
+
+
+def _registry_id_header_from_payload(payload: dict[str, Any]) -> dict[str, str] | None:
+    for key in ("id", "Id", "registry_id", "RegistryId"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _uni_registry_id_header(value.strip())
+    return None
 
 
 def _resource_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1115,27 +1312,37 @@ class UniRegistryClient:
     def delete_record(self, record_id: str) -> Any:
         return self.request("DELETE", f"/api/v1/records/{quote(record_id, safe='')}")
 
-    def create_resource(self, payload: dict[str, Any]) -> Any:
-        return self.request("POST", "/CreateUniRegistry", _resource_payload(payload))
+    def create_resource(self, payload: dict[str, Any], *, with_id: bool = False) -> Any:
+        headers = _uni_test_suffix_header() if with_id else None
+        return self.request(
+            "POST", "/CreateUniRegistry", _resource_payload(payload), headers=headers
+        )
 
     def get_resource(self, resource_id: str, top: dict[str, Any]) -> Any:
+        headers = _uni_registry_id_header(resource_id)
         return self.request(
             "POST",
             "/GetUniRegistry",
             {"Id": resource_id, **_top_payload(top)},
+            headers=headers,
         )
 
     def list_resources(self, payload: dict[str, Any]) -> Any:
         return self.request("POST", "/ListUniRegistries", _resource_payload(payload))
 
     def update_resource(self, payload: dict[str, Any]) -> Any:
-        return self.request("POST", "/UpdateUniRegistry", _resource_payload(payload))
+        headers = _registry_id_header_from_payload(payload)
+        return self.request(
+            "POST", "/UpdateUniRegistry", _resource_payload(payload), headers=headers
+        )
 
     def delete_resource(self, resource_id: str, top: dict[str, Any]) -> Any:
+        headers = _uni_registry_id_header(resource_id)
         return self.request(
             "POST",
             "/DeleteUniRegistry",
             {"Id": resource_id, **_top_payload(top)},
+            headers=headers,
         )
 
     def start_a2a_uni_migration(
@@ -1161,6 +1368,71 @@ class UniRegistryClient:
             "POST",
             "/GetA2aUniMigration",
             {"Id": migration_id},
+            headers=headers,
+        )
+
+    def retry_a2a_uni_migration(
+        self,
+        migration_id: str,
+        *,
+        version: int,
+        registry_id: str | None = None,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
+        return self.request(
+            "POST",
+            "/RetryA2aUniMigration",
+            {"Id": migration_id, "Version": version},
+            headers=headers,
+        )
+
+    def start_skill_uni_migration(
+        self,
+        resource_id: str,
+        top: dict[str, Any],
+        *,
+        workspace_id: str,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(resource_id) if with_id else None
+        return self.request(
+            "POST",
+            "/StartSkillUniMigration",
+            {"Id": resource_id, "WorkspaceId": workspace_id, **_top_payload(top)},
+            headers=headers,
+        )
+
+    def get_skill_uni_migration(
+        self,
+        migration_id: str,
+        *,
+        workspace_id: str,
+        registry_id: str | None = None,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
+        return self.request(
+            "POST",
+            "/GetSkillUniMigration",
+            {"Id": migration_id, "WorkspaceId": workspace_id},
+            headers=headers,
+        )
+
+    def retry_skill_uni_migration(
+        self,
+        migration_id: str,
+        *,
+        workspace_id: str,
+        version: int,
+        registry_id: str | None = None,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
+        return self.request(
+            "POST",
+            "/RetrySkillUniMigration",
+            {"Id": migration_id, "WorkspaceId": workspace_id, "Version": version},
             headers=headers,
         )
 
@@ -1595,21 +1867,10 @@ def create_resource(
         min=1.0,
         help="Maximum polling time in seconds when only --wait is enabled.",
     ),
-    a2a_syncer: bool = typer.Option(
-        False,
-        "--a2a-syncer/--no-a2a-syncer",
-        help=(
-            "After creation, wait for UniRegistry readiness, start A2A Uni "
-            "migration, and poll the migration result. The total timeout is 30 minutes."
-        ),
-    ),
     with_id: bool = typer.Option(
         False,
         "--with-id/--no-with-id",
-        help=(
-            "Add X-Mse-Uni-Registry-Id with the created UniRegistry ID to "
-            "A2A Uni migration requests."
-        ),
+        help="Add X-Mse-Uni-Test-Suffix to CreateUniRegistry.",
     ),
 ) -> None:
     """Create a managed UniRegistry resource."""
@@ -1638,7 +1899,7 @@ def create_resource(
     options = _options(ctx)
     client = _client(options)
     parsed_top = _json_object(top, "--top")
-    response = client.create_resource(payload)
+    response = client.create_resource(payload, with_id=with_id)
     _cache_resource_response(response, options)
     resource_id = _registry_id_from_response(response)
     if resource_id:
@@ -1647,60 +1908,372 @@ def create_resource(
         error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
         _set_default_registry_id(resource_id)
         error_console.print(f"Set default UniRegistry id: {resource_id}")
-    migration_result = None
-    if wait or a2a_syncer:
+    if wait:
         if not resource_id:
             raise UniRegistryAPIError(
                 "CreateUniRegistry response does not include a registry ID to poll"
             )
-        deadline = time.monotonic() + _A2A_SYNCER_TOTAL_TIMEOUT_SECONDS
-        registry_timeout = (
-            deadline - time.monotonic() if a2a_syncer else wait_timeout
-        )
         wait_result = _wait_for_registry_ready(
             client,
             resource_id,
             interval=wait_interval,
-            timeout=registry_timeout,
+            timeout=wait_timeout,
             top=parsed_top,
         )
         final_response = wait_result.get("GetUniRegistryResponse")
         _cache_resource_response(final_response, options, resource_id)
-        if a2a_syncer:
-            if not wait_result.get("Ready"):
-                raise UniRegistryAPIError(
-                    "UniRegistry did not become ready; skip A2A Uni migration"
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise UniRegistryAPIError(
-                    "A2A Uni migration was not started because the 30-minute "
-                    "timeout was exhausted while waiting for UniRegistry readiness"
-                )
-            error_console.print(f"Starting A2A Uni migration: registry_id={resource_id}")
-            start_response = client.start_a2a_uni_migration(
-                resource_id, parsed_top, with_id=with_id
-            )
-            migration_id = _migration_id_from_response(start_response) or resource_id
-            start_request_id = _request_id_from_response(start_response)
-            request_id_text = (
-                f" request_id={start_request_id}" if start_request_id else ""
-            )
-            error_console.print(
-                f"Started A2A Uni migration: id={migration_id}{request_id_text}"
-            )
-            migration_result = _wait_for_a2a_uni_migration(
-                client,
-                migration_id,
-                registry_id=resource_id,
-                with_id=with_id,
-                interval=wait_interval,
-                deadline=deadline,
-            )
     else:
         wait_result = None
     _print(
-        _registry_create_summary(response, wait_result, migration_result),
+        _registry_create_summary(response, wait_result),
+        options["output"],
+    )
+
+
+@registry_app.command("syncer")
+@_handle_api_errors
+def syncer_resource(
+    ctx: typer.Context,
+    registry_id: str | None = typer.Option(
+        None,
+        "--registry-id",
+        help="Existing UniRegistry ID. Defaults to uni_registry.defaults.registry_id.",
+    ),
+    sync_type: str | None = typer.Option(
+        None,
+        "--type",
+        help="Migration type: a2a or skill. Defaults to both.",
+    ),
+    gateway_id: str | None = typer.Option(
+        None,
+        "--gateway-id",
+        help="Gateway ID used when syncer needs to create a UniRegistry.",
+    ),
+    top: str | None = typer.Option(None, "--top"),
+    wait_interval: float = typer.Option(
+        10.0,
+        "--wait-interval",
+        min=0.1,
+        help="Polling interval in seconds.",
+    ),
+    timeout: float = typer.Option(
+        _A2A_SYNCER_TOTAL_TIMEOUT_SECONDS,
+        "--timeout",
+        min=1.0,
+        help="Maximum time in seconds for registry readiness and migration polling.",
+    ),
+    workspace_id: str | None = typer.Option(
+        None,
+        "--workspace-id",
+        help="Workspace ID required by Skill Uni migration APIs.",
+    ),
+    with_id: bool = typer.Option(
+        False,
+        "--with-id/--no-with-id",
+        help="Add X-Mse-Uni-Test-Suffix to CreateUniRegistry when creation is needed.",
+    ),
+) -> None:
+    """Create or reuse a UniRegistry, then run migration syncers."""
+    normalized_type = (sync_type or "").strip().lower()
+    if normalized_type and normalized_type not in {"a2a", "skill"}:
+        raise typer.BadParameter("--type must be a2a or skill")
+    run_a2a_syncer = normalized_type in {"", "a2a"}
+    run_skill_syncer = normalized_type in {"", "skill"}
+    if run_skill_syncer and not workspace_id:
+        raise typer.BadParameter("--workspace-id is required for Skill migration")
+
+    options = _options(ctx)
+    client = _client(options)
+    parsed_top = _json_object(top, "--top")
+    create_response: Any | None = None
+    created = False
+    resource_id = (registry_id or _default_registry_id() or "").strip()
+    if resource_id:
+        error_console.print(f"Using UniRegistry: id={resource_id}")
+    else:
+        payload = _default_syncer_create_payload(gateway_id)
+        create_response = client.create_resource(payload, with_id=with_id)
+        _cache_resource_response(create_response, options)
+        resource_id = _registry_id_from_response(create_response) or ""
+        if not resource_id:
+            raise UniRegistryAPIError(
+                "CreateUniRegistry response does not include a registry ID to poll"
+            )
+        created = True
+        request_id = _request_id_from_response(create_response)
+        request_id_text = f" request_id={request_id}" if request_id else ""
+        error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
+        _set_default_registry_id(resource_id)
+        error_console.print(f"Set default UniRegistry id: {resource_id}")
+
+    deadline = time.monotonic() + timeout
+    wait_result = _wait_for_registry_ready(
+        client,
+        resource_id,
+        interval=wait_interval,
+        timeout=timeout,
+        top=parsed_top,
+    )
+    final_response = wait_result.get("GetUniRegistryResponse")
+    _cache_resource_response(final_response, options, resource_id)
+    if not wait_result.get("Ready"):
+        raise UniRegistryAPIError("UniRegistry did not become ready; skip Uni migration")
+    migration_registry_id = _registry_id_from_response(final_response) or resource_id
+    migration_result = None
+    skill_migration_result = None
+    if run_a2a_syncer:
+        migration_result = _start_and_wait_uni_migration(
+            client,
+            label="A2A Uni migration",
+            registry_id=migration_registry_id,
+            top=parsed_top,
+            start_migration=client.start_a2a_uni_migration,
+            wait_migration=_wait_for_a2a_uni_migration,
+            interval=wait_interval,
+            deadline=deadline,
+        )
+    if run_skill_syncer:
+        skill_migration_result = _start_and_wait_uni_migration(
+            client,
+            label="Skill Uni migration",
+            registry_id=migration_registry_id,
+            top=parsed_top,
+            start_migration=client.start_skill_uni_migration,
+            wait_migration=_wait_for_skill_uni_migration,
+            start_kwargs={"workspace_id": workspace_id},
+            wait_kwargs={"workspace_id": workspace_id},
+            interval=wait_interval,
+            deadline=deadline,
+        )
+    _print(
+        _registry_syncer_summary(
+            registry_id=resource_id,
+            created=created,
+            create_response=create_response,
+            wait_result=wait_result,
+            migration_result=migration_result,
+            skill_migration_result=skill_migration_result,
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("start-a2a-migration")
+@_handle_api_errors
+def start_a2a_migration(
+    ctx: typer.Context,
+    resource_id: str | None = typer.Argument(
+        None,
+        help="UniRegistry ID. Defaults to uni_registry.defaults.registry_id.",
+    ),
+    top: str | None = typer.Option(None, "--top"),
+) -> None:
+    """Start A2A Uni migration for a UniRegistry."""
+    options = _options(ctx)
+    resolved_resource_id = _resolve_registry_id(resource_id, source_label="RESOURCE_ID")
+    response = _client(options).start_a2a_uni_migration(
+        resolved_resource_id,
+        _json_object(top, "--top"),
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response, fallback_id=resolved_resource_id, registry_id=resolved_resource_id
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("get-a2a-migration")
+@_handle_api_errors
+def get_a2a_migration(
+    ctx: typer.Context,
+    migration_id: str | None = typer.Argument(
+        None,
+        help=(
+            "A2A Uni migration ID. Defaults to the resolved UniRegistry ID when omitted."
+        ),
+    ),
+    registry_id: str | None = typer.Option(
+        None,
+        "--registry-id",
+        help="UniRegistry ID used for X-Mse-Uni-Registry-Id. Defaults to configured registry_id.",
+    ),
+) -> None:
+    """Get A2A Uni migration status."""
+    options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
+    resolved_migration_id = (migration_id or resolved_registry_id).strip()
+    response = _client(options).get_a2a_uni_migration(
+        resolved_migration_id,
+        registry_id=resolved_registry_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response,
+            fallback_id=resolved_migration_id,
+            registry_id=resolved_registry_id,
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("retry-a2a-migration")
+@_handle_api_errors
+def retry_a2a_migration(
+    ctx: typer.Context,
+    migration_id: str | None = typer.Argument(
+        None,
+        help="A2A Uni migration ID. Defaults to the resolved UniRegistry ID when omitted.",
+    ),
+    version: int = typer.Option(
+        ...,
+        "--version",
+        min=0,
+        help="Migration version.",
+    ),
+    registry_id: str | None = typer.Option(
+        None,
+        "--registry-id",
+        help="UniRegistry ID used for X-Mse-Uni-Registry-Id. Defaults to configured registry_id.",
+    ),
+) -> None:
+    """Retry A2A Uni migration."""
+    options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
+    resolved_migration_id = (migration_id or resolved_registry_id).strip()
+    response = _client(options).retry_a2a_uni_migration(
+        resolved_migration_id,
+        version=version,
+        registry_id=resolved_registry_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response,
+            fallback_id=resolved_migration_id,
+            registry_id=resolved_registry_id,
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("start-skill-migration")
+@_handle_api_errors
+def start_skill_migration(
+    ctx: typer.Context,
+    resource_id: str | None = typer.Argument(
+        None,
+        help="UniRegistry ID. Defaults to uni_registry.defaults.registry_id.",
+    ),
+    top: str | None = typer.Option(None, "--top"),
+    workspace_id: str = typer.Option(
+        ...,
+        "--workspace-id",
+        help="Workspace ID required by Skill Uni migration APIs.",
+    ),
+) -> None:
+    """Start Skill Uni migration for a UniRegistry."""
+    options = _options(ctx)
+    resolved_resource_id = _resolve_registry_id(resource_id, source_label="RESOURCE_ID")
+    response = _client(options).start_skill_uni_migration(
+        resolved_resource_id,
+        _json_object(top, "--top"),
+        workspace_id=workspace_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response, fallback_id=resolved_resource_id, registry_id=resolved_resource_id
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("get-skill-migration")
+@_handle_api_errors
+def get_skill_migration(
+    ctx: typer.Context,
+    migration_id: str | None = typer.Argument(
+        None,
+        help=(
+            "Skill Uni migration ID. Defaults to the resolved UniRegistry ID when omitted."
+        ),
+    ),
+    registry_id: str | None = typer.Option(
+        None,
+        "--registry-id",
+        help="UniRegistry ID used for X-Mse-Uni-Registry-Id. Defaults to configured registry_id.",
+    ),
+    workspace_id: str = typer.Option(
+        ...,
+        "--workspace-id",
+        help="Workspace ID required by Skill Uni migration APIs.",
+    ),
+) -> None:
+    """Get Skill Uni migration status."""
+    options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
+    resolved_migration_id = (migration_id or resolved_registry_id).strip()
+    response = _client(options).get_skill_uni_migration(
+        resolved_migration_id,
+        workspace_id=workspace_id,
+        registry_id=resolved_registry_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response,
+            fallback_id=resolved_migration_id,
+            registry_id=resolved_registry_id,
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("retry-skill-migration")
+@_handle_api_errors
+def retry_skill_migration(
+    ctx: typer.Context,
+    migration_id: str | None = typer.Argument(
+        None,
+        help="Skill Uni migration ID. Defaults to the resolved UniRegistry ID when omitted.",
+    ),
+    version: int = typer.Option(
+        ...,
+        "--version",
+        min=0,
+        help="Migration version.",
+    ),
+    registry_id: str | None = typer.Option(
+        None,
+        "--registry-id",
+        help="UniRegistry ID used for X-Mse-Uni-Registry-Id. Defaults to configured registry_id.",
+    ),
+    workspace_id: str = typer.Option(
+        ...,
+        "--workspace-id",
+        help="Workspace ID required by Skill Uni migration APIs.",
+    ),
+) -> None:
+    """Retry Skill Uni migration."""
+    options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
+    resolved_migration_id = (migration_id or resolved_registry_id).strip()
+    response = _client(options).retry_skill_uni_migration(
+        resolved_migration_id,
+        workspace_id=workspace_id,
+        version=version,
+        registry_id=resolved_registry_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response,
+            fallback_id=resolved_migration_id,
+            registry_id=resolved_registry_id,
+        ),
         options["output"],
     )
 
