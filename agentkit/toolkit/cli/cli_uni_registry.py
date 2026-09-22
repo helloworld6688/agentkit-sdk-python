@@ -2452,7 +2452,10 @@ def list_resources(
 @_handle_api_errors
 def update_resource(
     ctx: typer.Context,
-    resource_id: str,
+    registry_id: str | None = typer.Argument(
+        None,
+        help="UniRegistry ID. Defaults to uni_registry.defaults.registry_id.",
+    ),
     replicas: int | None = typer.Option(None, "--replicas", min=1),
     network_spec: str | None = typer.Option(None, "--network-spec"),
     monitor_spec: str | None = typer.Option(None, "--monitor-spec"),
@@ -2466,8 +2469,9 @@ def update_resource(
     ),
 ) -> None:
     """Update a managed UniRegistry resource."""
+    resolved_resource_id = _resolve_registry_id(registry_id, source_label="REGISTRY_ID")
     payload = _json_request(json_body, json_file)
-    payload["id"] = resource_id
+    payload["id"] = resolved_resource_id
     if replicas is not None:
         payload["replicas"] = replicas
     for key, value, option in [
@@ -2482,8 +2486,8 @@ def update_resource(
         raise typer.BadParameter("provide at least one field to update")
     options = _options(ctx)
     response = _client(options).update_resource(payload)
-    _cache_resource_response(response, options, resource_id)
-    _print(_registry_update_summary(response, resource_id), options["output"])
+    _cache_resource_response(response, options, resolved_resource_id)
+    _print(_registry_update_summary(response, resolved_resource_id), options["output"])
 
 
 @registry_app.command("delete")

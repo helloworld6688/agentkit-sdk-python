@@ -1878,6 +1878,80 @@ def test_resource_update_prints_compact_registry_summary(monkeypatch):
     assert "ResponseMetadata" not in result.output
 
 
+def test_resource_update_uses_default_registry_id(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {"uni_registry": {"defaults": {"registry_id": "ur-default"}}}
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-update"},
+                "Result": {
+                    "Registry": {
+                        "Id": "ur-default",
+                        "Status": "Running",
+                        "NetworkSpec": {"AclEntries": ["203.0.113.10/32"]},
+                    }
+                },
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://control.test",
+            "registry",
+            "update",
+            "--json",
+            '{"NetworkSpec":{"AclEntries":["203.0.113.10/32"]}}',
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:2] == ("POST", "https://control.test/UpdateUniRegistry")
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
+    assert json.loads(calls[0][2]["data"]) == {
+        "Id": "ur-default",
+        "NetworkSpec": {"AclEntries": ["203.0.113.10/32"]},
+    }
+    output = json.loads(result.output)
+    assert output["id"] == "ur-default"
+    assert output["acl_entries"] == ["203.0.113.10/32"]
+
+
+def test_resource_update_help_uses_registry_id_argument_name():
+    from agentkit.toolkit.cli.cli import app
+
+    result = runner.invoke(app, ["uni-reg", "registry", "update", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "[registry_id]" in result.output
+    assert "[resource_id]" not in result.output
+    assert "REGISTRY_ID" in result.output
+    assert "RESOURCE_ID" not in result.output
+
+
 def test_resource_delete_adds_registry_id_header(monkeypatch):
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
