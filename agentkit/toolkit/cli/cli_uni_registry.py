@@ -92,6 +92,14 @@ def _has_any_key(payload: dict[str, Any], *keys: str) -> bool:
     return any(key in payload for key in keys)
 
 
+def _has_non_empty_any_key(payload: dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
 def _require_payload_keys(payload: dict[str, Any], option_name: str, *keys: str) -> None:
     missing = [key for key in keys if key not in payload]
     if missing:
@@ -259,6 +267,11 @@ def _default_registry_id() -> str | None:
     return resolved or None
 
 
+def _default_gateway_id() -> str | None:
+    resolved = str(_uni_registry_defaults().get("gateway_id") or "").strip()
+    return resolved or None
+
+
 def _resolve_registry_id(
     registry_id: str | None, *, source_label: str = "--registry-id"
 ) -> str:
@@ -266,6 +279,20 @@ def _resolve_registry_id(
     if not resolved:
         raise typer.BadParameter(
             f"provide {source_label} or set uni_registry.defaults.registry_id"
+        )
+    return resolved
+
+
+def _resolve_gateway_id(gateway_id: str | None) -> str:
+    if gateway_id is not None:
+        resolved = gateway_id.strip()
+        if resolved:
+            return resolved
+        raise typer.BadParameter("--gateway-id is required")
+    resolved = _default_gateway_id()
+    if not resolved:
+        raise typer.BadParameter(
+            "provide --gateway-id or set uni_registry.defaults.gateway_id"
         )
     return resolved
 
@@ -1057,7 +1084,7 @@ def _uni_test_suffix_header() -> dict[str, str]:
     return {"X-Mse-Uni-Test-Suffix": "test"}
 
 
-def _default_syncer_create_payload(gateway_id: str | None) -> dict[str, Any]:
+def _default_syncer_create_payload(gateway_id: str) -> dict[str, Any]:
     return {
         "Name": f"registry-{secrets.token_hex(4)}",
         "Replicas": 2,
@@ -1067,7 +1094,7 @@ def _default_syncer_create_payload(gateway_id: str | None) -> dict[str, Any]:
             "EipBandwidth": 1,
             "IpVersion": "IPv4",
         },
-        "GatewayId": gateway_id or "",
+        "GatewayId": gateway_id,
     }
 
 
@@ -1084,6 +1111,7 @@ def _resource_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "id": "Id",
         "name": "Name",
         "replicas": "Replicas",
+        "gateway_id": "GatewayId",
         "network_spec": "NetworkSpec",
         "monitor_spec": "MonitorSpec",
         "project_name": "ProjectName",
@@ -1845,6 +1873,11 @@ def create_resource(
     deletion_protection_enabled: bool | None = typer.Option(
         None, "--deletion-protection-enabled/--no-deletion-protection"
     ),
+    gateway_id: str | None = typer.Option(
+        None,
+        "--gateway-id",
+        help="Gateway ID hosting the UniRegistry. Defaults to uni_registry.defaults.gateway_id.",
+    ),
     top: str | None = typer.Option(None, "--top"),
     json_body: str | None = typer.Option(None, "--json", help="Full request JSON."),
     json_file: str | None = typer.Option(
@@ -1892,10 +1925,28 @@ def create_resource(
         payload["tags"] = _tags(tag)
     if deletion_protection_enabled is not None:
         payload["deletion_protection_enabled"] = deletion_protection_enabled
+    if gateway_id is not None:
+        resolved_gateway_id = gateway_id.strip()
+        if not resolved_gateway_id:
+            raise typer.BadParameter("--gateway-id is required")
+        payload["gateway_id"] = resolved_gateway_id
+    elif _has_any_key(payload, "gateway_id", "GatewayId"):
+        if not _has_non_empty_any_key(payload, "gateway_id", "GatewayId"):
+            raise typer.BadParameter(
+                "provide --gateway-id or GatewayId/gateway_id in --json"
+            )
+    else:
+        default_gateway_id = _default_gateway_id()
+        if default_gateway_id:
+            payload["gateway_id"] = default_gateway_id
     if not _has_any_key(payload, "name", "Name"):
         raise typer.BadParameter("provide --name or Name/name in --json")
     if not _has_any_key(payload, "replicas", "Replicas"):
         raise typer.BadParameter("provide --replicas or Replicas/replicas in --json")
+    if not _has_non_empty_any_key(payload, "gateway_id", "GatewayId"):
+        raise typer.BadParameter(
+            "provide --gateway-id, GatewayId/gateway_id in --json, or set uni_registry.defaults.gateway_id"
+        )
     options = _options(ctx)
     client = _client(options)
     parsed_top = _json_object(top, "--top")
@@ -1906,8 +1957,6 @@ def create_resource(
         request_id = _request_id_from_response(response)
         request_id_text = f" request_id={request_id}" if request_id else ""
         error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
-        _set_default_registry_id(resource_id)
-        error_console.print(f"Set default UniRegistry id: {resource_id}")
     if wait:
         if not resource_id:
             raise UniRegistryAPIError(
@@ -1922,6 +1971,10 @@ def create_resource(
         )
         final_response = wait_result.get("GetUniRegistryResponse")
         _cache_resource_response(final_response, options, resource_id)
+        if wait_result.get("Ready"):
+            default_registry_id = _registry_id_from_response(final_response) or resource_id
+            _set_default_registry_id(default_registry_id)
+            error_console.print(f"Set default UniRegistry id: {default_registry_id}")
     else:
         wait_result = None
     _print(
@@ -1947,7 +2000,7 @@ def syncer_resource(
     gateway_id: str | None = typer.Option(
         None,
         "--gateway-id",
-        help="Gateway ID used when syncer needs to create a UniRegistry.",
+        help="Gateway ID hosting the UniRegistry. Defaults to uni_registry.defaults.gateway_id.",
     ),
     top: str | None = typer.Option(None, "--top"),
     wait_interval: float = typer.Option(
@@ -1977,6 +2030,7 @@ def syncer_resource(
     normalized_type = (sync_type or "").strip().lower()
     if normalized_type and normalized_type not in {"a2a", "skill"}:
         raise typer.BadParameter("--type must be a2a or skill")
+    gateway_id = _resolve_gateway_id(gateway_id)
     run_a2a_syncer = normalized_type in {"", "a2a"}
     run_skill_syncer = normalized_type in {"", "skill"}
     if run_skill_syncer and not workspace_id:
@@ -2003,8 +2057,6 @@ def syncer_resource(
         request_id = _request_id_from_response(create_response)
         request_id_text = f" request_id={request_id}" if request_id else ""
         error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
-        _set_default_registry_id(resource_id)
-        error_console.print(f"Set default UniRegistry id: {resource_id}")
 
     deadline = time.monotonic() + timeout
     wait_result = _wait_for_registry_ready(
@@ -2019,6 +2071,9 @@ def syncer_resource(
     if not wait_result.get("Ready"):
         raise UniRegistryAPIError("UniRegistry did not become ready; skip Uni migration")
     migration_registry_id = _registry_id_from_response(final_response) or resource_id
+    if created:
+        _set_default_registry_id(migration_registry_id)
+        error_console.print(f"Set default UniRegistry id: {migration_registry_id}")
     migration_result = None
     skill_migration_result = None
     if run_a2a_syncer:

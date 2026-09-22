@@ -419,6 +419,7 @@ def test_resource_create_accepts_full_json_body(
                 {
                     "Name": "uni-public-demo",
                     "Replicas": 1,
+                    "GatewayId": "g-1",
                     "DeletionProtectionEnabled": True,
                     "NetworkSpec": {
                         "NetworkType": ["PUBLIC"],
@@ -435,12 +436,17 @@ def test_resource_create_accepts_full_json_body(
     assert "Created UniRegistry: id=ur-1 request_id=req-create" in result.output
     output = json.loads(result.output[result.output.index("{") :])
     assert output == {"id": "ur-1", "request_id": "req-create"}
-    assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-1"
-    assert isolated_uni_registry_config["uni_registry"]["default_registry_id"] == "ur-1"
+    assert "registry_id" not in isolated_uni_registry_config.get("uni_registry", {}).get(
+        "defaults", {}
+    )
+    assert "default_registry_id" not in isolated_uni_registry_config.get(
+        "uni_registry", {}
+    )
     assert calls[0][0:2] == ("POST", "https://open.volcengineapi.com/")
     assert json.loads(calls[0][2]["data"]) == {
         "Name": "uni-public-demo",
         "Replicas": 1,
+        "GatewayId": "g-1",
         "DeletionProtectionEnabled": True,
         "NetworkSpec": {
             "NetworkType": ["PUBLIC"],
@@ -450,7 +456,9 @@ def test_resource_create_accepts_full_json_body(
     }
 
 
-def test_resource_create_waits_until_registry_running(monkeypatch):
+def test_resource_create_waits_until_registry_running(
+    monkeypatch, isolated_uni_registry_config
+):
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
 
@@ -507,6 +515,8 @@ def test_resource_create_waits_until_registry_running(monkeypatch):
             "create",
             "--json",
             json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
+            "--gateway-id",
+            "g-1",
             "--wait",
             "--wait-interval",
             "0.1",
@@ -540,6 +550,56 @@ def test_resource_create_waits_until_registry_running(monkeypatch):
     assert "request_id=req-get-running" in result.output
     assert "status=Creating" in result.output
     assert "status=Running" in result.output
+    assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-1"
+
+
+def test_resource_create_uses_default_gateway_id(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "gateway_id": "g-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"Result": {"Id": "ur-1"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "create",
+            "--json",
+            json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"])["GatewayId"] == "g-default"
 
 
 def test_resource_create_help_does_not_include_syncer_options():
@@ -552,6 +612,30 @@ def test_resource_create_help_does_not_include_syncer_options():
     assert "--skill-syncer" not in result.output
     assert "--syncer" not in result.output
     assert "--workspace-id" not in result.output
+    assert "--gateway-id" in result.output
+
+
+def test_resource_create_requires_gateway_id():
+    from agentkit.toolkit.cli.cli import app
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://open.volcengineapi.com",
+            "--service",
+            "agentkit_stg",
+            "registry",
+            "create",
+            "--json",
+            json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "provide --gateway-id" in result.output
+    assert "uni_registry.defaults.gateway_id" in result.output
 
 
 def test_resource_syncer_uses_existing_default_and_requested_type(
@@ -565,6 +649,7 @@ def test_resource_syncer_uses_existing_default_and_requested_type(
             "uni_registry": {
                 "defaults": {
                     "registry_id": "ur-default",
+                    "gateway_id": "g-default",
                     "server": "https://open.volcengineapi.com",
                     "region": "cn-beijing",
                     "service": "agentkit_stg",
@@ -640,6 +725,73 @@ def test_resource_syncer_uses_existing_default_and_requested_type(
     assert output["created"] is False
     assert output["a2a_syncer"]["id"] == "mig-a2a"
     assert "skill_syncer" not in output
+
+
+def test_resource_syncer_gateway_id_option_overrides_default(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "gateway_id": "g-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response({"Result": {"Id": "ur-1"}})
+        if action == "GetUniRegistry":
+            return _Response(
+                {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
+            )
+        if action == "StartA2aUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-a2a"}})
+        if action == "GetA2aUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "abc123ef")
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+            "--gateway-id",
+            "g-explicit",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"])["GatewayId"] == "g-explicit"
 
 
 def test_resource_syncer_creates_when_no_default_and_runs_both(
@@ -747,10 +899,10 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
     assert output["created"] is True
     assert output["a2a_syncer"]["id"] == "mig-a2a"
     assert output["skill_syncer"]["id"] == "mig-skill"
-    assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-1"
+    assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-ready"
 
 
-def test_resource_syncer_create_defaults_gateway_id_to_empty_string(
+def test_resource_syncer_requires_gateway_id(
     monkeypatch, isolated_uni_registry_config
 ):
     import agentkit.toolkit.cli.cli_uni_registry as registry
@@ -760,6 +912,7 @@ def test_resource_syncer_create_defaults_gateway_id_to_empty_string(
         {
             "uni_registry": {
                 "defaults": {
+                    "registry_id": "ur-default",
                     "server": "https://open.volcengineapi.com",
                     "region": "cn-beijing",
                     "service": "agentkit_stg",
@@ -771,23 +924,9 @@ def test_resource_syncer_create_defaults_gateway_id_to_empty_string(
 
     def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
-        action = kwargs.get("params", {}).get("Action")
-        if action == "CreateUniRegistry":
-            return _Response({"Result": {"Id": "ur-1"}})
-        if action == "GetUniRegistry":
-            return _Response(
-                {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
-            )
-        if action == "StartA2aUniMigration":
-            return _Response({"Result": {"MigrationId": "mig-a2a"}})
-        if action == "GetA2aUniMigration":
-            return _Response(
-                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
-            )
         return _Response()
 
     monkeypatch.setattr(registry.requests, "request", request)
-    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "def456ab")
     monkeypatch.setattr(
         registry.UniRegistryClient,
         "_load_credentials",
@@ -797,7 +936,18 @@ def test_resource_syncer_create_defaults_gateway_id_to_empty_string(
         ),
     )
 
-    result = runner.invoke(
+    missing = runner.invoke(
+        app, ["uni-reg", "registry", "syncer", "--type", "a2a"]
+    )
+
+    assert missing.exit_code == 2
+    assert (
+        "provide --gateway-id or set uni_registry.defaults.gateway_id"
+        in missing.output
+    )
+    assert not calls
+
+    empty = runner.invoke(
         app,
         [
             "uni-reg",
@@ -805,23 +955,14 @@ def test_resource_syncer_create_defaults_gateway_id_to_empty_string(
             "syncer",
             "--type",
             "a2a",
-            "--wait-interval",
-            "0.1",
+            "--gateway-id",
+            "",
         ],
     )
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(calls[0][2]["data"]) == {
-        "Name": "registry-def456ab",
-        "Replicas": 2,
-        "DeletionProtectionEnabled": False,
-        "NetworkSpec": {
-            "NetworkType": ["PUBLIC"],
-            "EipBandwidth": 1,
-            "IpVersion": "IPv4",
-        },
-        "GatewayId": "",
-    }
+    assert empty.exit_code == 2
+    assert "--gateway-id is required" in empty.output
+    assert not calls
 
 
 def test_resource_start_a2a_migration_uses_default_registry_id(
