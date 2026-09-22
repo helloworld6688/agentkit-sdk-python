@@ -208,6 +208,22 @@ def _tags(values: list[str] | None) -> list[dict[str, str]]:
     return result
 
 
+def _acl_entries(
+    values: list[str] | None = None, comma_separated: str | None = None
+) -> list[str]:
+    entries: list[str] = []
+    raw_values = list(values or [])
+    if comma_separated is not None:
+        raw_values.extend(comma_separated.split(","))
+    for raw_value in raw_values:
+        entry = raw_value.strip()
+        if not entry:
+            raise typer.BadParameter("--acl-entry/--acl-entries must be non-empty")
+        if entry not in entries:
+            entries.append(entry)
+    return entries
+
+
 def _normalize_server(value: str) -> str:
     server = value.strip().rstrip("/")
     parsed = urlparse(server)
@@ -594,6 +610,8 @@ def _registry_syncer_summary(
     created: bool,
     create_response: Any | None,
     wait_result: dict[str, Any] | None,
+    acl_update_response: Any | None = None,
+    registry_response: Any | None = None,
     migration_result: dict[str, Any] | None = None,
     skill_migration_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -604,6 +622,10 @@ def _registry_syncer_summary(
             "request_id": _request_id_from_response(create_response),
         }
     )
+    if acl_update_response is not None:
+        summary["acl_update"] = _registry_update_summary(
+            acl_update_response, registry_id
+        )
     if wait_result is not None:
         summary["wait"] = _compact_dict(
             {
@@ -613,6 +635,10 @@ def _registry_syncer_summary(
                 "attempts": wait_result.get("Attempts"),
                 "request_id": wait_result.get("RequestId"),
             }
+        )
+    if created and registry_response is not None:
+        summary["registry"] = _registry_detail_summary(
+            registry_response, fallback_id=registry_id
         )
     if migration_result is not None:
         summary["a2a_syncer"] = _compact_dict(
@@ -2020,6 +2046,16 @@ def syncer_resource(
         "--workspace-id",
         help="Workspace ID required by Skill Uni migration APIs.",
     ),
+    acl_entry: list[str] | None = typer.Option(
+        None,
+        "--acl-entry",
+        help="CIDR whitelist entry to set when syncer creates a UniRegistry. Repeatable.",
+    ),
+    acl_entries: str | None = typer.Option(
+        None,
+        "--acl-entries",
+        help="Comma-separated CIDR whitelist entries to set when syncer creates a UniRegistry.",
+    ),
     with_id: bool = typer.Option(
         False,
         "--with-id/--no-with-id",
@@ -2035,11 +2071,13 @@ def syncer_resource(
     run_skill_syncer = normalized_type in {"", "skill"}
     if run_skill_syncer and not workspace_id:
         raise typer.BadParameter("--workspace-id is required for Skill migration")
+    resolved_acl_entries = _acl_entries(acl_entry, acl_entries)
 
     options = _options(ctx)
     client = _client(options)
     parsed_top = _json_object(top, "--top")
     create_response: Any | None = None
+    acl_update_response: Any | None = None
     created = False
     resource_id = (registry_id or _default_registry_id() or "").strip()
     if resource_id:
@@ -2057,6 +2095,20 @@ def syncer_resource(
         request_id = _request_id_from_response(create_response)
         request_id_text = f" request_id={request_id}" if request_id else ""
         error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
+        if resolved_acl_entries:
+            error_console.print(
+                f"Updating UniRegistry ACL entries: id={resource_id} entries={len(resolved_acl_entries)}"
+            )
+            acl_update_response = client.update_resource(
+                {
+                    "Id": resource_id,
+                    "NetworkSpec": {
+                        "NetworkType": ["PUBLIC"],
+                        "AclEntries": resolved_acl_entries,
+                    },
+                }
+            )
+            _cache_resource_response(acl_update_response, options, resource_id)
 
     deadline = time.monotonic() + timeout
     wait_result = _wait_for_registry_ready(
@@ -2106,6 +2158,8 @@ def syncer_resource(
             created=created,
             create_response=create_response,
             wait_result=wait_result,
+            acl_update_response=acl_update_response,
+            registry_response=final_response if created else None,
             migration_result=migration_result,
             skill_migration_result=skill_migration_result,
         ),

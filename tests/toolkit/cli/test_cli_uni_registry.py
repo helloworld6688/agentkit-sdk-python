@@ -666,7 +666,16 @@ def test_resource_syncer_uses_existing_default_and_requested_type(
             return _Response(
                 {
                     "ResponseMetadata": {"RequestId": "req-get"},
-                    "Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}},
+                    "Result": {
+                        "Registry": {
+                            "Id": "ur-ready",
+                            "Status": "Running",
+                            "PublicAddress": "115.190.137.250:80",
+                            "PrivateAddress": "192.168.0.10:80",
+                            "Username": "uni",
+                            "InitialPassword": "initial-secret",
+                        }
+                    },
                 }
             )
         if action == "StartA2aUniMigration":
@@ -709,6 +718,8 @@ def test_resource_syncer_uses_existing_default_and_requested_type(
             "syncer",
             "--type",
             "a2a",
+            "--acl-entry",
+            "0.0.0.0/0",
         ],
     )
 
@@ -725,6 +736,110 @@ def test_resource_syncer_uses_existing_default_and_requested_type(
     assert output["created"] is False
     assert output["a2a_syncer"]["id"] == "mig-a2a"
     assert "skill_syncer" not in output
+
+
+def test_resource_syncer_updates_acl_entries_only_when_created(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response({"Result": {"Id": "ur-1"}})
+        if action == "UpdateUniRegistry":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-update"},
+                    "Result": {
+                        "Registry": {
+                            "Id": "ur-1",
+                            "NetworkSpec": {"AclEntries": ["0.0.0.0/0", "1.1.1.1/32"]},
+                        }
+                    },
+                }
+            )
+        if action == "GetUniRegistry":
+            return _Response(
+                {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
+            )
+        if action == "StartA2aUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-a2a"}})
+        if action == "GetA2aUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "abc123ef")
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+            "--gateway-id",
+            "g-1",
+            "--acl-entry",
+            "0.0.0.0/0",
+            "--acl-entry",
+            "1.1.1.1/32",
+            "--acl-entries",
+            "0.0.0.0/0",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [call[2]["params"]["Action"] for call in calls] == [
+        "CreateUniRegistry",
+        "UpdateUniRegistry",
+        "GetUniRegistry",
+        "StartA2aUniMigration",
+        "GetA2aUniMigration",
+    ]
+    assert json.loads(calls[1][2]["data"]) == {
+        "Id": "ur-1",
+        "NetworkSpec": {
+            "NetworkType": ["PUBLIC"],
+            "AclEntries": ["0.0.0.0/0", "1.1.1.1/32"],
+        },
+    }
+    assert calls[1][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-1"
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output["acl_update"] == {
+        "id": "ur-1",
+        "request_id": "req-update",
+        "acl_entries": ["0.0.0.0/0", "1.1.1.1/32"],
+    }
 
 
 def test_resource_syncer_gateway_id_option_overrides_default(
@@ -827,7 +942,16 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
             return _Response(
                 {
                     "ResponseMetadata": {"RequestId": "req-get"},
-                    "Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}},
+                    "Result": {
+                        "Registry": {
+                            "Id": "ur-ready",
+                            "Status": "Running",
+                            "PublicAddress": "115.190.137.250:80",
+                            "PrivateAddress": "192.168.0.10:80",
+                            "Username": "uni",
+                            "InitialPassword": "initial-secret",
+                        }
+                    },
                 }
             )
         if action == "StartA2aUniMigration":
@@ -897,6 +1021,16 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
     output = json.loads(result.output[result.output.index("{") :])
     assert output["id"] == "ur-1"
     assert output["created"] is True
+    assert output["registry"] == {
+        "id": "ur-ready",
+        "request_id": "req-get",
+        "status": "Running",
+        "public_address": "115.190.137.250:80",
+        "private_address": "192.168.0.10:80",
+        "ui_url": "http://115.190.137.250:80/ui",
+        "username": "uni",
+        "password": "initial-secret",
+    }
     assert output["a2a_syncer"]["id"] == "mig-a2a"
     assert output["skill_syncer"]["id"] == "mig-skill"
     assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-ready"
