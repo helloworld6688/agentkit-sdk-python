@@ -2095,20 +2095,6 @@ def syncer_resource(
         request_id = _request_id_from_response(create_response)
         request_id_text = f" request_id={request_id}" if request_id else ""
         error_console.print(f"Created UniRegistry: id={resource_id}{request_id_text}")
-        if resolved_acl_entries:
-            error_console.print(
-                f"Updating UniRegistry ACL entries: id={resource_id} entries={len(resolved_acl_entries)}"
-            )
-            acl_update_response = client.update_resource(
-                {
-                    "Id": resource_id,
-                    "NetworkSpec": {
-                        "NetworkType": ["PUBLIC"],
-                        "AclEntries": resolved_acl_entries,
-                    },
-                }
-            )
-            _cache_resource_response(acl_update_response, options, resource_id)
 
     deadline = time.monotonic() + timeout
     wait_result = _wait_for_registry_ready(
@@ -2126,6 +2112,22 @@ def syncer_resource(
     if created:
         _set_default_registry_id(migration_registry_id)
         error_console.print(f"Set default UniRegistry id: {migration_registry_id}")
+        if resolved_acl_entries:
+            error_console.print(
+                f"Updating UniRegistry ACL entries: id={migration_registry_id} entries={len(resolved_acl_entries)}"
+            )
+            acl_update_response = client.update_resource(
+                {
+                    "Id": migration_registry_id,
+                    "NetworkSpec": {
+                        "NetworkType": ["PUBLIC"],
+                        "AclEntries": resolved_acl_entries,
+                    },
+                }
+            )
+            _cache_resource_response(
+                acl_update_response, options, migration_registry_id
+            )
     migration_result = None
     skill_migration_result = None
     if run_a2a_syncer:

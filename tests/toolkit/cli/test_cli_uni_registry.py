@@ -768,7 +768,7 @@ def test_resource_syncer_updates_acl_entries_only_when_created(
                     "ResponseMetadata": {"RequestId": "req-update"},
                     "Result": {
                         "Registry": {
-                            "Id": "ur-1",
+                            "Id": "ur-ready",
                             "NetworkSpec": {"AclEntries": ["0.0.0.0/0", "1.1.1.1/32"]},
                         }
                     },
@@ -821,22 +821,22 @@ def test_resource_syncer_updates_acl_entries_only_when_created(
     assert result.exit_code == 0, result.output
     assert [call[2]["params"]["Action"] for call in calls] == [
         "CreateUniRegistry",
-        "UpdateUniRegistry",
         "GetUniRegistry",
+        "UpdateUniRegistry",
         "StartA2aUniMigration",
         "GetA2aUniMigration",
     ]
-    assert json.loads(calls[1][2]["data"]) == {
-        "Id": "ur-1",
+    assert json.loads(calls[2][2]["data"]) == {
+        "Id": "ur-ready",
         "NetworkSpec": {
             "NetworkType": ["PUBLIC"],
             "AclEntries": ["0.0.0.0/0", "1.1.1.1/32"],
         },
     }
-    assert calls[1][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-1"
+    assert calls[2][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-ready"
     output = json.loads(result.output[result.output.index("{") :])
     assert output["acl_update"] == {
-        "id": "ur-1",
+        "id": "ur-ready",
         "request_id": "req-update",
         "acl_entries": ["0.0.0.0/0", "1.1.1.1/32"],
     }
@@ -2053,6 +2053,48 @@ def test_search_set_create_then_provisions_mcp_and_reads_toolset(monkeypatch):
         "Version": "2025-10-30",
     }
     assert json.loads(calls[2][2]["data"]) == {"MCPToolsetId": "mt-1"}
+
+
+def test_search_set_create_rejects_mcp_service_path_query(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"search_set": {"name": "skill2"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+
+    service = {
+        "Name": "mcp-skill2",
+        "Path": "/mcp?search_set=skill2",
+        "ProtocolType": "MCP",
+        "NetworkConfigurations": [{"NetworkType": "Public"}],
+        "BackendType": "Function",
+        "BackendConfiguration": {"FunctionConfiguration": {"FunctionId": "fn-1"}},
+    }
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://control.test",
+            "search-set",
+            "create",
+            "--name",
+            "skill2",
+            "--resource-id",
+            "record-1",
+            "--mcp-service-json",
+            json.dumps(service),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "Path only supports a route path" in result.output
+    assert calls == []
 
 
 def test_search_set_create_persists_mcp_route_under_registry(monkeypatch):
