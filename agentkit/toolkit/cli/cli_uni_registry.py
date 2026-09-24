@@ -331,6 +331,31 @@ def _set_default_registry_id(registry_id: str) -> None:
     write_global_config_dict(data)
 
 
+def _remove_registry_config(registry_id: str) -> None:
+    normalized_id = registry_id.strip()
+    if not normalized_id:
+        return
+    data = read_global_config_dict(force_reload=True)
+    section = data.get("uni_registry")
+    if not isinstance(section, dict):
+        return
+
+    defaults = section.get("defaults")
+    if isinstance(defaults, dict):
+        if str(defaults.get("registry_id") or "").strip() == normalized_id:
+            defaults.pop("registry_id", None)
+    if str(section.get("default_registry_id") or "").strip() == normalized_id:
+        section.pop("default_registry_id", None)
+
+    registries = section.get("registries")
+    if isinstance(registries, dict):
+        registries.pop(normalized_id, None)
+
+    global _REGISTRY_CONFIG_CACHE
+    _REGISTRY_CONFIG_CACHE = None
+    write_global_config_dict(data)
+
+
 def _registry_configs(force_reload: bool = False) -> dict[str, dict[str, Any]]:
     global _REGISTRY_CONFIG_CACHE
     if _REGISTRY_CONFIG_CACHE is not None and not force_reload:
@@ -500,14 +525,33 @@ def _compact_dict(value: dict[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if item is not None}
 
 
-def _registry_ui_url(public_address: Any) -> str | None:
-    if not isinstance(public_address, str) or not public_address.strip():
+def _clean_registry_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
         return None
-    address = public_address.strip().rstrip("/")
+    address = value.strip().strip("`").strip().rstrip("/")
+    if not address:
+        return None
+    return address
+
+
+def _registry_ui_url(public_address: Any) -> str | None:
+    address = _clean_registry_url(public_address)
+    if not address:
+        return None
     parsed = urlparse(address if "://" in address else f"http://{address}")
     if not parsed.netloc:
         return None
-    return f"http://{parsed.netloc}/ui"
+    return f"{parsed.geturl().rstrip('/')}/ui"
+
+
+def _registry_login_url(gateway_url: Any, public_address: Any) -> str | None:
+    gateway = _clean_registry_url(gateway_url)
+    if gateway:
+        parsed = urlparse(gateway if "://" in gateway else f"http://{gateway}")
+        if parsed.netloc:
+            base = parsed.geturl().rstrip("/")
+            return f"{base}/ui"
+    return _registry_ui_url(public_address)
 
 
 def _registry_create_summary(
@@ -561,16 +605,18 @@ def _registry_create_summary(
 
 def _registry_detail_summary(response: Any, fallback_id: str | None = None) -> dict[str, Any]:
     public_address = _first_registry_field(response, "public_address", "PublicAddress")
+    gateway_url = _first_registry_field(response, "gateway_url", "GatewayUrl")
     return _compact_dict(
         {
             "id": _registry_id_from_response(response) or fallback_id,
             "request_id": _request_id_from_response(response),
             "status": _registry_status_from_response(response),
+            "gateway_url": _clean_registry_url(gateway_url),
             "public_address": public_address,
             "private_address": _first_registry_field(
                 response, "private_address", "PrivateAddress"
             ),
-            "ui_url": _registry_ui_url(public_address),
+            "ui_url": _registry_login_url(gateway_url, public_address),
             "username": _first_registry_field(
                 response, "username", "Username", "user_name", "UserName"
             )
@@ -610,7 +656,6 @@ def _registry_syncer_summary(
     created: bool,
     create_response: Any | None,
     wait_result: dict[str, Any] | None,
-    acl_update_response: Any | None = None,
     registry_response: Any | None = None,
     migration_result: dict[str, Any] | None = None,
     skill_migration_result: dict[str, Any] | None = None,
@@ -622,10 +667,6 @@ def _registry_syncer_summary(
             "request_id": _request_id_from_response(create_response),
         }
     )
-    if acl_update_response is not None:
-        summary["acl_update"] = _registry_update_summary(
-            acl_update_response, registry_id
-        )
     if wait_result is not None:
         summary["wait"] = _compact_dict(
             {
@@ -1110,16 +1151,177 @@ def _uni_test_suffix_header() -> dict[str, str]:
     return {"X-Mse-Uni-Test-Suffix": "test"}
 
 
-def _default_syncer_create_payload(gateway_id: str) -> dict[str, Any]:
+def _registry_network_spec(
+    network_type: list[str] | None = None,
+    *,
+    vpc_id: str | None = None,
+    subnet_id: list[str] | None = None,
+    acl_entries: list[str] | None = None,
+    default_network_type: list[str] | None = None,
+) -> dict[str, Any]:
+    raw_types = network_type or default_network_type or []
+    if not raw_types:
+        raw_types = ["PUBLIC", "PRIVATE"]
+
+    normalized_types: list[str] = []
+    for raw_type in raw_types:
+        for part in raw_type.split(","):
+            value = part.strip().upper()
+            if not value:
+                continue
+            if value not in {"PUBLIC", "PRIVATE"}:
+                raise typer.BadParameter("--network-type must be PUBLIC or PRIVATE")
+            if value not in normalized_types:
+                normalized_types.append(value)
+    if not normalized_types:
+        normalized_types = ["PUBLIC", "PRIVATE"]
+
+    normalized_vpc_id = (vpc_id or "").strip()
+    normalized_subnet_ids: list[str] = []
+    for raw_subnet_id in subnet_id or []:
+        for part in raw_subnet_id.split(","):
+            value = part.strip()
+            if value and value not in normalized_subnet_ids:
+                normalized_subnet_ids.append(value)
+    normalized_acl_entries: list[str] = []
+    for raw_acl_entry in acl_entries or []:
+        value = raw_acl_entry.strip()
+        if value and value not in normalized_acl_entries:
+            normalized_acl_entries.append(value)
+    if "PRIVATE" in normalized_types:
+        if not normalized_vpc_id:
+            raise typer.BadParameter(
+                "--vpc-id is required when PRIVATE network is enabled"
+            )
+        if not normalized_subnet_ids:
+            raise typer.BadParameter(
+                "--subnet-id is required when PRIVATE network is enabled"
+            )
+    if "PUBLIC" in normalized_types and not normalized_acl_entries:
+        raise typer.BadParameter(
+            "--acl-entry/--acl-entries is required when PUBLIC network is enabled"
+        )
+
+    spec: dict[str, Any] = {"NetworkType": normalized_types}
+    if "PUBLIC" in normalized_types:
+        spec["EipBandwidth"] = 1
+        spec["IpVersion"] = "IPv4"
+        spec["AclEntries"] = normalized_acl_entries
+    if "PRIVATE" in normalized_types:
+        spec["VpcId"] = normalized_vpc_id
+        spec["SubnetId"] = normalized_subnet_ids
+    return spec
+
+
+def _network_spec_list_field(spec: dict[str, Any], *keys: str) -> list[str]:
+    for key in keys:
+        value = spec.get(key)
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value]
+    return []
+
+
+def _apply_registry_network_spec(
+    payload: dict[str, Any],
+    *,
+    network_type: list[str] | None = None,
+    vpc_id: str | None = None,
+    subnet_id: list[str] | None = None,
+    acl_entries: list[str] | None = None,
+) -> None:
+    has_network_options = (
+        bool(network_type)
+        or vpc_id is not None
+        or bool(subnet_id)
+        or bool(acl_entries)
+    )
+    existing_key = (
+        "NetworkSpec"
+        if "NetworkSpec" in payload
+        else "network_spec"
+        if "network_spec" in payload
+        else None
+    )
+    if existing_key is None and not has_network_options:
+        payload["network_spec"] = _registry_network_spec(
+            vpc_id=vpc_id, subnet_id=subnet_id, acl_entries=acl_entries
+        )
+        return
+    if existing_key is None:
+        payload["network_spec"] = _registry_network_spec(
+            network_type,
+            vpc_id=vpc_id,
+            subnet_id=subnet_id,
+            acl_entries=acl_entries,
+        )
+        return
+
+    existing = payload[existing_key]
+    if not isinstance(existing, dict):
+        raise typer.BadParameter("NetworkSpec/network_spec must be a JSON object")
+    if not has_network_options:
+        _registry_network_spec(
+            _network_spec_list_field(existing, "NetworkType", "network_type"),
+            vpc_id=next(
+                (
+                    value
+                    for value in (
+                        existing.get("VpcId"),
+                        existing.get("vpc_id"),
+                    )
+                    if isinstance(value, str)
+                ),
+                None,
+            ),
+            subnet_id=_network_spec_list_field(existing, "SubnetId", "subnet_id"),
+            acl_entries=_network_spec_list_field(
+                existing, "AclEntries", "acl_entries", "ACLEntries"
+            ),
+        )
+        return
+
+    generated = _registry_network_spec(
+        network_type,
+        vpc_id=vpc_id
+        or next(
+            (
+                value
+                for value in (existing.get("VpcId"), existing.get("vpc_id"))
+                if isinstance(value, str)
+            ),
+            None,
+        ),
+        subnet_id=subnet_id
+        or _network_spec_list_field(existing, "SubnetId", "subnet_id"),
+        acl_entries=acl_entries
+        or _network_spec_list_field(existing, "AclEntries", "acl_entries", "ACLEntries"),
+        default_network_type=_network_spec_list_field(
+            existing, "NetworkType", "network_type"
+        ),
+    )
+    existing.update(generated)
+
+
+def _default_syncer_create_payload(
+    gateway_id: str,
+    *,
+    network_type: list[str] | None = None,
+    vpc_id: str | None = None,
+    subnet_id: list[str] | None = None,
+    acl_entries: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "Name": f"registry-{secrets.token_hex(4)}",
         "Replicas": 2,
-        "DeletionProtectionEnabled": False,
-        "NetworkSpec": {
-            "NetworkType": ["PUBLIC"],
-            "EipBandwidth": 1,
-            "IpVersion": "IPv4",
-        },
+        "DeletionProtectionEnabled": True,
+        "NetworkSpec": _registry_network_spec(
+            network_type,
+            vpc_id=vpc_id,
+            subnet_id=subnet_id,
+            acl_entries=acl_entries,
+        ),
         "GatewayId": gateway_id,
     }
 
@@ -1534,6 +1736,8 @@ def _registry_updates_from_registry_response(
     updates: dict[str, Any] = {}
     for source, target in [
         ("server", "server"),
+        ("gateway_url", "gateway_url"),
+        ("GatewayUrl", "gateway_url"),
         ("private_address", "private_address"),
         ("PrivateAddress", "private_address"),
         ("public_address", "public_address"),
@@ -1541,11 +1745,22 @@ def _registry_updates_from_registry_response(
     ]:
         value = registry.get(source)
         if isinstance(value, str) and value.strip():
+            normalized_value = (
+                _clean_registry_url(value) if target == "gateway_url" else value
+            )
+            if not normalized_value:
+                continue
             try:
-                updates[target] = _normalize_server(value)
+                updates[target] = _normalize_server(normalized_value)
             except typer.BadParameter:
                 # A provisioning instance can expose an address before it is usable.
                 continue
+    login_url = _registry_login_url(
+        registry.get("gateway_url") or registry.get("GatewayUrl"),
+        registry.get("public_address") or registry.get("PublicAddress"),
+    )
+    if login_url:
+        updates["ui_url"] = login_url
     for key, value in {
         "username": username,
         "password": password,
@@ -1890,8 +2105,31 @@ def delete_record(
 def create_resource(
     ctx: typer.Context,
     name: str | None = typer.Option(None, "--name"),
-    replicas: int | None = typer.Option(None, "--replicas", min=1),
+    replicas: int | None = typer.Option(None, "--replicas", min=1, hidden=True),
     network_spec: str | None = typer.Option(None, "--network-spec"),
+    network_type: list[str] | None = typer.Option(
+        None,
+        "--network-type",
+        help="Network type for NetworkSpec: PUBLIC or PRIVATE. Repeatable. Defaults to PUBLIC,PRIVATE.",
+    ),
+    vpc_id: str | None = typer.Option(
+        None, "--vpc-id", help="VpcId required when PRIVATE network is enabled."
+    ),
+    subnet_id: list[str] | None = typer.Option(
+        None,
+        "--subnet-id",
+        help="SubnetId required when PRIVATE network is enabled. Repeatable.",
+    ),
+    acl_entry: list[str] | None = typer.Option(
+        None,
+        "--acl-entry",
+        help="CIDR whitelist entry required when PUBLIC network is enabled. Repeatable.",
+    ),
+    acl_entries: str | None = typer.Option(
+        None,
+        "--acl-entries",
+        help="Comma-separated CIDR whitelist entries required when PUBLIC network is enabled.",
+    ),
     monitor_spec: str | None = typer.Option(None, "--monitor-spec"),
     project_name: str | None = typer.Option(None, "--project-name"),
     tag: list[str] | None = typer.Option(None, "--tag"),
@@ -1951,6 +2189,14 @@ def create_resource(
         payload["tags"] = _tags(tag)
     if deletion_protection_enabled is not None:
         payload["deletion_protection_enabled"] = deletion_protection_enabled
+    resolved_acl_entries = _acl_entries(acl_entry, acl_entries)
+    _apply_registry_network_spec(
+        payload,
+        network_type=network_type,
+        vpc_id=vpc_id,
+        subnet_id=subnet_id,
+        acl_entries=resolved_acl_entries,
+    )
     if gateway_id is not None:
         resolved_gateway_id = gateway_id.strip()
         if not resolved_gateway_id:
@@ -1968,7 +2214,11 @@ def create_resource(
     if not _has_any_key(payload, "name", "Name"):
         raise typer.BadParameter("provide --name or Name/name in --json")
     if not _has_any_key(payload, "replicas", "Replicas"):
-        raise typer.BadParameter("provide --replicas or Replicas/replicas in --json")
+        payload["replicas"] = 2
+    if not _has_any_key(
+        payload, "deletion_protection_enabled", "DeletionProtectionEnabled"
+    ):
+        payload["deletion_protection_enabled"] = True
     if not _has_non_empty_any_key(payload, "gateway_id", "GatewayId"):
         raise typer.BadParameter(
             "provide --gateway-id, GatewayId/gateway_id in --json, or set uni_registry.defaults.gateway_id"
@@ -2028,6 +2278,19 @@ def syncer_resource(
         "--gateway-id",
         help="Gateway ID hosting the UniRegistry. Defaults to uni_registry.defaults.gateway_id.",
     ),
+    network_type: list[str] | None = typer.Option(
+        None,
+        "--network-type",
+        help="Network type for created UniRegistry: PUBLIC or PRIVATE. Repeatable. Defaults to PUBLIC,PRIVATE.",
+    ),
+    vpc_id: str | None = typer.Option(
+        None, "--vpc-id", help="VpcId required when PRIVATE network is enabled."
+    ),
+    subnet_id: list[str] | None = typer.Option(
+        None,
+        "--subnet-id",
+        help="SubnetId required when PRIVATE network is enabled. Repeatable.",
+    ),
     top: str | None = typer.Option(None, "--top"),
     wait_interval: float = typer.Option(
         10.0,
@@ -2077,13 +2340,18 @@ def syncer_resource(
     client = _client(options)
     parsed_top = _json_object(top, "--top")
     create_response: Any | None = None
-    acl_update_response: Any | None = None
     created = False
     resource_id = (registry_id or _default_registry_id() or "").strip()
     if resource_id:
         error_console.print(f"Using UniRegistry: id={resource_id}")
     else:
-        payload = _default_syncer_create_payload(gateway_id)
+        payload = _default_syncer_create_payload(
+            gateway_id,
+            network_type=network_type,
+            vpc_id=vpc_id,
+            subnet_id=subnet_id,
+            acl_entries=resolved_acl_entries,
+        )
         create_response = client.create_resource(payload, with_id=with_id)
         _cache_resource_response(create_response, options)
         resource_id = _registry_id_from_response(create_response) or ""
@@ -2112,22 +2380,6 @@ def syncer_resource(
     if created:
         _set_default_registry_id(migration_registry_id)
         error_console.print(f"Set default UniRegistry id: {migration_registry_id}")
-        if resolved_acl_entries:
-            error_console.print(
-                f"Updating UniRegistry ACL entries: id={migration_registry_id} entries={len(resolved_acl_entries)}"
-            )
-            acl_update_response = client.update_resource(
-                {
-                    "Id": migration_registry_id,
-                    "NetworkSpec": {
-                        "NetworkType": ["PUBLIC"],
-                        "AclEntries": resolved_acl_entries,
-                    },
-                }
-            )
-            _cache_resource_response(
-                acl_update_response, options, migration_registry_id
-            )
     migration_result = None
     skill_migration_result = None
     if run_a2a_syncer:
@@ -2160,7 +2412,6 @@ def syncer_resource(
             created=created,
             create_response=create_response,
             wait_result=wait_result,
-            acl_update_response=acl_update_response,
             registry_response=final_response if created else None,
             migration_result=migration_result,
             skill_migration_result=skill_migration_result,
@@ -2501,12 +2752,12 @@ def delete_resource(
 ) -> None:
     """Delete a managed UniRegistry resource."""
     options = _options(ctx)
+    response = _client(options).delete_resource(
+        resource_id, _json_object(top, "--top")
+    )
+    _remove_registry_config(resource_id)
     _print(
-        _mask_sensitive(
-            _client(options).delete_resource(
-                resource_id, _json_object(top, "--top")
-            )
-        ),
+        _mask_sensitive(response),
         options["output"],
     )
 

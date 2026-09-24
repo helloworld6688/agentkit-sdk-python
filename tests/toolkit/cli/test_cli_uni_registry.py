@@ -425,6 +425,7 @@ def test_resource_create_accepts_full_json_body(
                         "NetworkType": ["PUBLIC"],
                         "EipBandwidth": 1,
                         "IpVersion": "IPv4",
+                        "AclEntries": ["0.0.0.0/0"],
                     },
                 }
             ),
@@ -452,6 +453,7 @@ def test_resource_create_accepts_full_json_body(
             "NetworkType": ["PUBLIC"],
             "EipBandwidth": 1,
             "IpVersion": "IPv4",
+            "AclEntries": ["0.0.0.0/0"],
         },
     }
 
@@ -517,6 +519,12 @@ def test_resource_create_waits_until_registry_running(
             json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
             "--gateway-id",
             "g-1",
+            "--vpc-id",
+            "vpc-xxx",
+            "--subnet-id",
+            "subnet-a",
+            "--acl-entry",
+            "0.0.0.0/0",
             "--wait",
             "--wait-interval",
             "0.1",
@@ -595,11 +603,215 @@ def test_resource_create_uses_default_gateway_id(
             "create",
             "--json",
             json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
+            "--vpc-id",
+            "vpc-xxx",
+            "--subnet-id",
+            "subnet-a,subnet-b",
+            "--acl-entry",
+            "0.0.0.0/0",
         ],
     )
 
     assert result.exit_code == 0, result.output
     assert json.loads(calls[0][2]["data"])["GatewayId"] == "g-default"
+    assert json.loads(calls[0][2]["data"])["DeletionProtectionEnabled"] is True
+    assert json.loads(calls[0][2]["data"])["NetworkSpec"] == {
+        "NetworkType": ["PUBLIC", "PRIVATE"],
+        "EipBandwidth": 1,
+        "IpVersion": "IPv4",
+        "AclEntries": ["0.0.0.0/0"],
+        "VpcId": "vpc-xxx",
+        "SubnetId": ["subnet-a", "subnet-b"],
+    }
+
+
+def test_resource_create_supports_private_network_options(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"Result": {"Id": "ur-1"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "create",
+            "--name",
+            "uni-private-demo",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PRIVATE",
+            "--vpc-id",
+            "vpc-xxx",
+            "--subnet-id",
+            "subnet-a,subnet-b",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "uni-private-demo",
+        "Replicas": 2,
+        "GatewayId": "g-1",
+        "DeletionProtectionEnabled": True,
+        "NetworkSpec": {
+            "NetworkType": ["PRIVATE"],
+            "VpcId": "vpc-xxx",
+            "SubnetId": ["subnet-a", "subnet-b"],
+        },
+    }
+
+
+def test_resource_create_supports_public_network_options(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"Result": {"Id": "ur-1"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "create",
+            "--name",
+            "uni-public-demo",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PUBLIC",
+            "--acl-entry",
+            "0.0.0.0/0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "uni-public-demo",
+        "Replicas": 2,
+        "GatewayId": "g-1",
+        "DeletionProtectionEnabled": True,
+        "NetworkSpec": {
+            "NetworkType": ["PUBLIC"],
+            "EipBandwidth": 1,
+            "IpVersion": "IPv4",
+            "AclEntries": ["0.0.0.0/0"],
+        },
+    }
+
+
+def test_resource_create_can_disable_default_deletion_protection(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"Result": {"Id": "ur-1"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "create",
+            "--name",
+            "uni-public-demo",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PUBLIC",
+            "--acl-entry",
+            "0.0.0.0/0",
+            "--no-deletion-protection",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"])["DeletionProtectionEnabled"] is False
+
+
+def test_resource_create_private_network_requires_vpc_and_subnet():
+    from agentkit.toolkit.cli.cli import app
+
+    missing_vpc = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "create",
+            "--name",
+            "uni-private-demo",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PRIVATE",
+            "--subnet-id",
+            "subnet-a",
+        ],
+    )
+    assert missing_vpc.exit_code != 0
+    assert "--vpc-id is required" in missing_vpc.output
+
+    missing_subnet = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "create",
+            "--name",
+            "uni-private-demo",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PRIVATE",
+            "--vpc-id",
+            "vpc-xxx",
+        ],
+    )
+    assert missing_subnet.exit_code != 0
+    assert "--subnet-id is required" in missing_subnet.output
 
 
 def test_resource_create_help_does_not_include_syncer_options():
@@ -613,6 +825,31 @@ def test_resource_create_help_does_not_include_syncer_options():
     assert "--syncer" not in result.output
     assert "--workspace-id" not in result.output
     assert "--gateway-id" in result.output
+    assert "--network-type" in result.output
+    assert "--acl-entry" in result.output
+    assert "--vpc-id" in result.output
+    assert "--subnet-id" in result.output
+    assert "--replicas" not in result.output
+
+
+def test_resource_create_defaults_to_public_private_and_requires_vpc_subnet():
+    from agentkit.toolkit.cli.cli import app
+
+    missing_private_options = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "create",
+            "--name",
+            "uni-public-demo",
+            "--gateway-id",
+            "g-1",
+        ],
+    )
+
+    assert missing_private_options.exit_code != 0
+    assert "--vpc-id is required" in missing_private_options.output
 
 
 def test_resource_create_requires_gateway_id():
@@ -630,6 +867,10 @@ def test_resource_create_requires_gateway_id():
             "create",
             "--json",
             json.dumps({"Name": "uni-public-demo", "Replicas": 1}),
+            "--network-type",
+            "PUBLIC",
+            "--acl-entry",
+            "0.0.0.0/0",
         ],
     )
 
@@ -738,7 +979,7 @@ def test_resource_syncer_uses_existing_default_and_requested_type(
     assert "skill_syncer" not in output
 
 
-def test_resource_syncer_updates_acl_entries_only_when_created(
+def test_resource_syncer_adds_acl_entries_to_create_when_created(
     monkeypatch, isolated_uni_registry_config
 ):
     import agentkit.toolkit.cli.cli_uni_registry as registry
@@ -762,18 +1003,6 @@ def test_resource_syncer_updates_acl_entries_only_when_created(
         action = kwargs.get("params", {}).get("Action")
         if action == "CreateUniRegistry":
             return _Response({"Result": {"Id": "ur-1"}})
-        if action == "UpdateUniRegistry":
-            return _Response(
-                {
-                    "ResponseMetadata": {"RequestId": "req-update"},
-                    "Result": {
-                        "Registry": {
-                            "Id": "ur-ready",
-                            "NetworkSpec": {"AclEntries": ["0.0.0.0/0", "1.1.1.1/32"]},
-                        }
-                    },
-                }
-            )
         if action == "GetUniRegistry":
             return _Response(
                 {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
@@ -807,6 +1036,10 @@ def test_resource_syncer_updates_acl_entries_only_when_created(
             "a2a",
             "--gateway-id",
             "g-1",
+            "--vpc-id",
+            "vpc-xxx",
+            "--subnet-id",
+            "subnet-a",
             "--acl-entry",
             "0.0.0.0/0",
             "--acl-entry",
@@ -822,23 +1055,121 @@ def test_resource_syncer_updates_acl_entries_only_when_created(
     assert [call[2]["params"]["Action"] for call in calls] == [
         "CreateUniRegistry",
         "GetUniRegistry",
-        "UpdateUniRegistry",
         "StartA2aUniMigration",
         "GetA2aUniMigration",
     ]
-    assert json.loads(calls[2][2]["data"]) == {
-        "Id": "ur-ready",
+    assert json.loads(calls[0][2]["data"])["NetworkSpec"] == {
+        "NetworkType": ["PUBLIC", "PRIVATE"],
+        "EipBandwidth": 1,
+        "IpVersion": "IPv4",
+        "AclEntries": ["0.0.0.0/0", "1.1.1.1/32"],
+        "VpcId": "vpc-xxx",
+        "SubnetId": ["subnet-a"],
+    }
+    output = json.loads(result.output[result.output.index("{") :])
+    assert "acl_update" not in output
+
+
+def test_resource_syncer_requires_acl_entries_when_public_network_enabled(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.clear()
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PUBLIC",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--acl-entry/--acl-entries is required" in result.output
+
+
+def test_resource_syncer_supports_public_network_only(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response({"Result": {"Id": "ur-1"}})
+        if action == "GetUniRegistry":
+            return _Response(
+                {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
+            )
+        if action == "StartA2aUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-a2a"}})
+        if action == "GetA2aUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "abc123ef")
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PUBLIC",
+            "--acl-entry",
+            "0.0.0.0/0",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "registry-abc123ef",
+        "Replicas": 2,
+        "DeletionProtectionEnabled": True,
         "NetworkSpec": {
             "NetworkType": ["PUBLIC"],
-            "AclEntries": ["0.0.0.0/0", "1.1.1.1/32"],
+            "EipBandwidth": 1,
+            "IpVersion": "IPv4",
+            "AclEntries": ["0.0.0.0/0"],
         },
-    }
-    assert calls[2][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-ready"
-    output = json.loads(result.output[result.output.index("{") :])
-    assert output["acl_update"] == {
-        "id": "ur-ready",
-        "request_id": "req-update",
-        "acl_entries": ["0.0.0.0/0", "1.1.1.1/32"],
+        "GatewayId": "g-1",
     }
 
 
@@ -900,6 +1231,12 @@ def test_resource_syncer_gateway_id_option_overrides_default(
             "a2a",
             "--gateway-id",
             "g-explicit",
+            "--vpc-id",
+            "vpc-xxx",
+            "--subnet-id",
+            "subnet-a",
+            "--acl-entry",
+            "0.0.0.0/0",
             "--wait-interval",
             "0.1",
         ],
@@ -987,6 +1324,12 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
             "syncer",
             "--gateway-id",
             "g-1",
+            "--vpc-id",
+            "vpc-xxx",
+            "--subnet-id",
+            "subnet-a,subnet-b",
+            "--acl-entry",
+            "0.0.0.0/0",
             "--workspace-id",
             "ws-1",
             "--wait-interval",
@@ -1006,11 +1349,14 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
     assert json.loads(calls[0][2]["data"]) == {
         "Name": "registry-abc123ef",
         "Replicas": 2,
-        "DeletionProtectionEnabled": False,
+        "DeletionProtectionEnabled": True,
         "NetworkSpec": {
-            "NetworkType": ["PUBLIC"],
+            "NetworkType": ["PUBLIC", "PRIVATE"],
             "EipBandwidth": 1,
             "IpVersion": "IPv4",
+            "AclEntries": ["0.0.0.0/0"],
+            "VpcId": "vpc-xxx",
+            "SubnetId": ["subnet-a", "subnet-b"],
         },
         "GatewayId": "g-1",
     }
@@ -1034,6 +1380,109 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
     assert output["a2a_syncer"]["id"] == "mig-a2a"
     assert output["skill_syncer"]["id"] == "mig-skill"
     assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-ready"
+
+
+def test_resource_syncer_create_supports_private_network_options(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response({"Result": {"Id": "ur-1"}})
+        if action == "GetUniRegistry":
+            return _Response(
+                {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
+            )
+        if action == "StartA2aUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-a2a"}})
+        if action == "GetA2aUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "abc123ef")
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+            "--gateway-id",
+            "g-1",
+            "--network-type",
+            "PRIVATE",
+            "--vpc-id",
+            "vpc-xxx",
+            "--subnet-id",
+            "subnet-a,subnet-b",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "registry-abc123ef",
+        "Replicas": 2,
+        "DeletionProtectionEnabled": True,
+        "NetworkSpec": {
+            "NetworkType": ["PRIVATE"],
+            "VpcId": "vpc-xxx",
+            "SubnetId": ["subnet-a", "subnet-b"],
+        },
+        "GatewayId": "g-1",
+    }
+
+
+def test_resource_syncer_defaults_to_public_private_and_requires_vpc_subnet(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.clear()
+
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "a2a",
+            "--gateway-id",
+            "g-1",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--vpc-id is required" in result.output
 
 
 def test_resource_syncer_requires_gateway_id(
@@ -1766,6 +2215,7 @@ def test_registry_get_prints_initial_password_and_skips_unusable_address(
                     "Registry": {
                         "Id": "ur-1",
                         "Status": "Running",
+                        "GatewayUrl": "`http://slic4kilg3si3n1d30t4f.apigateway-cn-beijing.volceapi.com`",
                         "PublicAddress": "115.190.137.250:80",
                         "PrivateAddress": "192.168.0.10:80",
                         "InitialPassword": "should-not-be-printed",
@@ -1798,15 +2248,18 @@ def test_registry_get_prints_initial_password_and_skips_unusable_address(
         "id": "ur-1",
         "request_id": "req-get",
         "status": "Running",
+        "gateway_url": "http://slic4kilg3si3n1d30t4f.apigateway-cn-beijing.volceapi.com",
         "public_address": "115.190.137.250:80",
         "private_address": "192.168.0.10:80",
-        "ui_url": "http://115.190.137.250:80/ui",
+        "ui_url": "http://slic4kilg3si3n1d30t4f.apigateway-cn-beijing.volceapi.com/ui",
         "username": "uni",
         "password": "should-not-be-printed",
     }
     assert "Replicas" not in result.output
     assert "ResponseMetadata" not in result.output
     assert registry._registry_config("ur-1") == {
+        "gateway_url": "http://slic4kilg3si3n1d30t4f.apigateway-cn-beijing.volceapi.com",
+        "ui_url": "http://slic4kilg3si3n1d30t4f.apigateway-cn-beijing.volceapi.com/ui",
         "username": "admin",
         "password": "secret",
         "service": "agentkit",
@@ -1989,6 +2442,120 @@ def test_resource_delete_adds_registry_id_header(monkeypatch):
     assert calls[0][0:2] == ("POST", "https://control.test/DeleteUniRegistry")
     assert json.loads(calls[0][2]["data"]) == {"Id": "ur-1"}
     assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-1"
+
+
+def test_resource_delete_removes_default_registry_id_and_binding(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-1",
+                    "gateway_id": "g-1",
+                },
+                "default_registry_id": "ur-1",
+                "registries": {
+                    "ur-1": {"server": "https://old.registry.test"},
+                    "ur-2": {"server": "https://keep.registry.test"},
+                },
+            }
+        }
+    )
+
+    def request(_method, _url, **_kwargs):
+        return _Response({"ResponseMetadata": {"RequestId": "req-delete"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://control.test",
+            "registry",
+            "delete",
+            "ur-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    uni_registry = isolated_uni_registry_config["uni_registry"]
+    assert "registry_id" not in uni_registry["defaults"]
+    assert "default_registry_id" not in uni_registry
+    assert "ur-1" not in uni_registry["registries"]
+    assert uni_registry["registries"]["ur-2"] == {
+        "server": "https://keep.registry.test"
+    }
+    assert uni_registry["defaults"]["gateway_id"] == "g-1"
+
+
+def test_resource_delete_keeps_default_registry_id_when_deleting_other_registry(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {"registry_id": "ur-default"},
+                "default_registry_id": "ur-default",
+                "registries": {
+                    "ur-default": {"server": "https://default.registry.test"},
+                    "ur-old": {"server": "https://old.registry.test"},
+                },
+            }
+        }
+    )
+
+    def request(_method, _url, **_kwargs):
+        return _Response({"ResponseMetadata": {"RequestId": "req-delete"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+            setattr(self, "region", "cn-beijing"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "--server",
+            "https://control.test",
+            "registry",
+            "delete",
+            "ur-old",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    uni_registry = isolated_uni_registry_config["uni_registry"]
+    assert uni_registry["defaults"]["registry_id"] == "ur-default"
+    assert uni_registry["default_registry_id"] == "ur-default"
+    assert "ur-old" not in uni_registry["registries"]
+    assert uni_registry["registries"]["ur-default"] == {
+        "server": "https://default.registry.test"
+    }
 
 
 def test_search_set_create_then_provisions_mcp_and_reads_toolset(monkeypatch):
