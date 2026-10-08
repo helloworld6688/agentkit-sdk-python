@@ -118,7 +118,9 @@ def test_invoke_api_error_metadata_becomes_apierror_with_code(client):
         return json.dumps(
             {
                 "ResponseMetadata": {
-                    "Error": {"Code": "SomeBizError", "Message": "boom"}
+                    "Action": "TestAction",
+                    "RequestId": "req-123",
+                    "Error": {"Code": "SomeBizError", "Message": "boom"},
                 }
             }
         )
@@ -129,3 +131,7 @@ def test_invoke_api_error_metadata_becomes_apierror_with_code(client):
         client._invoke_api("TestAction", _Req(), _Resp)
 
     assert excinfo.value.error_code == "SomeBizError"
+    assert excinfo.value.request_id == "req-123"
+    assert excinfo.value.action == "TestAction"
+    assert "request_id=req-123" in str(excinfo.value)
+    assert "action=TestAction" in str(excinfo.value)

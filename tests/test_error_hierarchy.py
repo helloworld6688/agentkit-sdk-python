@@ -74,6 +74,9 @@ def test_catching_the_root_catches_every_domain_error():
 def test_api_error_carries_optional_error_code():
     assert ApiError("boom").error_code is None
     assert ApiError("boom", error_code="SomeBizError").error_code == "SomeBizError"
+    error = ApiError("boom", request_id="req-123", action="TestAction")
+    assert error.request_id == "req-123"
+    assert error.action == "TestAction"
 
 
 def test_redact_shim_re_exports_canonical_implementation():

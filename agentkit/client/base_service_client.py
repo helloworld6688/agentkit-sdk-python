@@ -384,6 +384,8 @@ class BaseServiceClient(Service):
                 err = metadata.get("Error", {}) or {}
                 error_code = str(err.get("Code") or "")
                 error_msg = str(err.get("Message") or "Unknown error")
+                request_id = str(metadata.get("RequestId") or "").strip() or None
+                action = str(metadata.get("Action") or api_action or "").strip() or None
                 if attempt == 0 and (
                     self._is_probable_credential_error_code(error_code)
                     or self._is_probable_credential_error_text(error_msg)
@@ -394,9 +396,17 @@ class BaseServiceClient(Service):
                         error_code or "<none>",
                     )
                     continue
+                suffix = []
+                if action:
+                    suffix.append(f"action={action}")
+                if request_id:
+                    suffix.append(f"request_id={request_id}")
+                context = f" ({', '.join(suffix)})" if suffix else ""
                 raise ApiError(
-                    f"Failed to {api_action}: {error_msg}",
+                    f"Failed to {api_action}: {error_msg}{context}",
                     error_code=error_code or None,
+                    request_id=request_id,
+                    action=action,
                 )
 
             return response_type(**response_data.get("Result", {}))

@@ -115,12 +115,60 @@ def _stringify_record_json_fields(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _format_api_error(status_code: int, text: str) -> str:
+def _response_header_value(headers: Any, *names: str) -> str | None:
+    if not headers:
+        return None
+    for name in names:
+        value = headers.get(name) if hasattr(headers, "get") else None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _request_id_from_headers(headers: Any) -> str | None:
+    return _response_header_value(
+        headers,
+        "X-Request-Id",
+        "X-Request-ID",
+        "X-RequestId",
+        "X-Volc-Request-Id",
+        "X-Volc-Request-ID",
+        "Request-Id",
+        "Request-ID",
+        "RequestId",
+    )
+
+
+def _error_context_from_headers(headers: Any) -> list[str]:
+    context = []
+    request_id = _request_id_from_headers(headers)
+    if request_id:
+        context.append(f"request_id={request_id}")
+    log_id = _response_header_value(headers, "X-Tt-Logid", "X-Tt-LogId", "X-Log-Id")
+    if log_id:
+        context.append(f"log_id={log_id}")
+    trace_id = _response_header_value(
+        headers, "X-Tt-Trace-Id", "X-Trace-Id", "X-Bd-Trace-Id"
+    )
+    if trace_id:
+        context.append(f"trace_id={trace_id}")
+    return context
+
+
+def _append_error_context(message: str, context: list[str]) -> str:
+    if not context:
+        return message
+    return f"{message} ({', '.join(context)})"
+
+
+def _format_api_error(status_code: int, text: str, headers: Any = None) -> str:
+    header_context = _error_context_from_headers(headers)
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
         body = text.strip()
-        return f"HTTP {status_code}: {body[:1000]}" if body else f"HTTP {status_code}"
+        message = f"HTTP {status_code}: {body[:1000]}" if body else f"HTTP {status_code}"
+        return _append_error_context(message, header_context)
 
     if isinstance(payload, dict):
         metadata = payload.get("ResponseMetadata")
@@ -129,7 +177,11 @@ def _format_api_error(status_code: int, text: str) -> str:
             if isinstance(error, dict):
                 code = str(error.get("Code") or "").strip()
                 message = str(error.get("Message") or "").strip()
-                request_id = _request_id_from_response(payload) or ""
+                request_id = (
+                    _request_id_from_response(payload)
+                    or _request_id_from_headers(headers)
+                    or ""
+                )
                 action = str(metadata.get("Action") or "").strip()
                 parts = [f"HTTP {status_code}"]
                 if code:
@@ -141,20 +193,28 @@ def _format_api_error(status_code: int, text: str) -> str:
                     suffix.append(f"action={action}")
                 if request_id:
                     suffix.append(f"request_id={request_id}")
+                for item in header_context:
+                    if not item.startswith("request_id="):
+                        suffix.append(item)
                 result = ": ".join(parts)
                 if suffix:
                     result = f"{result} ({', '.join(suffix)})"
                 return result
 
-        request_id = _request_id_from_response(payload)
+        request_id = _request_id_from_response(payload) or _request_id_from_headers(
+            headers
+        )
         message = payload.get("message") or payload.get("Message") or payload.get("error")
         if isinstance(message, str) and message.strip():
             result = f"HTTP {status_code}: {message.strip()}"
-            if request_id:
-                result = f"{result} (request_id={request_id})"
-            return result
+            context = [f"request_id={request_id}"] if request_id else []
+            context.extend(
+                item for item in header_context if not item.startswith("request_id=")
+            )
+            return _append_error_context(result, context)
 
-    return f"HTTP {status_code}: {json.dumps(_mask_sensitive(payload), ensure_ascii=False)[:1000]}"
+    message = f"HTTP {status_code}: {json.dumps(_mask_sensitive(payload), ensure_ascii=False)[:1000]}"
+    return _append_error_context(message, header_context)
 
 
 def _api_error_message(exc: UniRegistryAPIError) -> str:
@@ -659,6 +719,7 @@ def _registry_syncer_summary(
     registry_response: Any | None = None,
     migration_result: dict[str, Any] | None = None,
     skill_migration_result: dict[str, Any] | None = None,
+    mcp_migration_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary = _compact_dict(
         {
@@ -703,6 +764,18 @@ def _registry_syncer_summary(
                 "attempts": skill_migration_result.get("Attempts"),
                 "request_id": skill_migration_result.get("RequestId"),
                 "message": skill_migration_result.get("Message"),
+            }
+        )
+    if mcp_migration_result is not None:
+        summary["mcp_syncer"] = _compact_dict(
+            {
+                "id": mcp_migration_result.get("Id"),
+                "status": mcp_migration_result.get("Status"),
+                "ready": mcp_migration_result.get("Ready"),
+                "timed_out": mcp_migration_result.get("TimedOut"),
+                "attempts": mcp_migration_result.get("Attempts"),
+                "request_id": mcp_migration_result.get("RequestId"),
+                "message": mcp_migration_result.get("Message"),
             }
         )
     return summary
@@ -807,6 +880,8 @@ def _migration_from_response(response: Any) -> dict[str, Any] | None:
         "Migration",
         "a2a_uni_migration",
         "A2aUniMigration",
+        "mcp_uni_migration",
+        "MCPUniMigration",
         "task",
         "Task",
     ):
@@ -1088,6 +1163,29 @@ def _wait_for_skill_uni_migration(
     )
 
 
+def _wait_for_mcp_uni_migration(
+    client: UniRegistryClient,
+    migration_id: str,
+    *,
+    workspace_id: str,
+    registry_id: str | None = None,
+    with_id: bool = False,
+    interval: float,
+    deadline: float,
+) -> dict[str, Any]:
+    return _wait_for_uni_migration(
+        migration_id,
+        label="MCP Uni migration",
+        response_key="GetMCPUniMigrationResponse",
+        get_migration=client.get_mcp_uni_migration,
+        registry_id=registry_id,
+        with_id=with_id,
+        get_kwargs={"workspace_id": workspace_id},
+        interval=interval,
+        deadline=deadline,
+    )
+
+
 def _start_and_wait_uni_migration(
     client: UniRegistryClient,
     *,
@@ -1159,23 +1257,6 @@ def _registry_network_spec(
     acl_entries: list[str] | None = None,
     default_network_type: list[str] | None = None,
 ) -> dict[str, Any]:
-    raw_types = network_type or default_network_type or []
-    if not raw_types:
-        raw_types = ["PUBLIC", "PRIVATE"]
-
-    normalized_types: list[str] = []
-    for raw_type in raw_types:
-        for part in raw_type.split(","):
-            value = part.strip().upper()
-            if not value:
-                continue
-            if value not in {"PUBLIC", "PRIVATE"}:
-                raise typer.BadParameter("--network-type must be PUBLIC or PRIVATE")
-            if value not in normalized_types:
-                normalized_types.append(value)
-    if not normalized_types:
-        normalized_types = ["PUBLIC", "PRIVATE"]
-
     normalized_vpc_id = (vpc_id or "").strip()
     normalized_subnet_ids: list[str] = []
     for raw_subnet_id in subnet_id or []:
@@ -1188,6 +1269,38 @@ def _registry_network_spec(
         value = raw_acl_entry.strip()
         if value and value not in normalized_acl_entries:
             normalized_acl_entries.append(value)
+
+    raw_types = network_type or default_network_type or []
+    if network_type is None:
+        existing_types = {
+            part.strip().upper()
+            for raw_type in raw_types
+            for part in raw_type.split(",")
+            if part.strip()
+        }
+        if normalized_acl_entries and "PUBLIC" not in existing_types:
+            raw_types = [*raw_types, "PUBLIC"]
+            existing_types.add("PUBLIC")
+        if (normalized_vpc_id or normalized_subnet_ids) and "PRIVATE" not in existing_types:
+            raw_types = [*raw_types, "PRIVATE"]
+
+    normalized_types: list[str] = []
+    for raw_type in raw_types:
+        for part in raw_type.split(","):
+            value = part.strip().upper()
+            if not value:
+                continue
+            if value not in {"PUBLIC", "PRIVATE"}:
+                raise typer.BadParameter("--network-type must be PUBLIC or PRIVATE")
+            if value not in normalized_types:
+                normalized_types.append(value)
+    if not normalized_types:
+        return {}
+
+    if "PUBLIC" in normalized_types and not normalized_acl_entries:
+        raise typer.BadParameter(
+            "--acl-entry/--acl-entries is required when PUBLIC network is enabled"
+        )
     if "PRIVATE" in normalized_types:
         if not normalized_vpc_id:
             raise typer.BadParameter(
@@ -1197,10 +1310,6 @@ def _registry_network_spec(
             raise typer.BadParameter(
                 "--subnet-id is required when PRIVATE network is enabled"
             )
-    if "PUBLIC" in normalized_types and not normalized_acl_entries:
-        raise typer.BadParameter(
-            "--acl-entry/--acl-entries is required when PUBLIC network is enabled"
-        )
 
     spec: dict[str, Any] = {"NetworkType": normalized_types}
     if "PUBLIC" in normalized_types:
@@ -1244,18 +1353,15 @@ def _apply_registry_network_spec(
         if "network_spec" in payload
         else None
     )
-    if existing_key is None and not has_network_options:
-        payload["network_spec"] = _registry_network_spec(
-            vpc_id=vpc_id, subnet_id=subnet_id, acl_entries=acl_entries
-        )
-        return
     if existing_key is None:
-        payload["network_spec"] = _registry_network_spec(
+        generated = _registry_network_spec(
             network_type,
             vpc_id=vpc_id,
             subnet_id=subnet_id,
             acl_entries=acl_entries,
         )
+        if generated:
+            payload["network_spec"] = generated
         return
 
     existing = payload[existing_key]
@@ -1312,18 +1418,21 @@ def _default_syncer_create_payload(
     subnet_id: list[str] | None = None,
     acl_entries: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "Name": f"registry-{secrets.token_hex(4)}",
         "Replicas": 2,
         "DeletionProtectionEnabled": True,
-        "NetworkSpec": _registry_network_spec(
-            network_type,
-            vpc_id=vpc_id,
-            subnet_id=subnet_id,
-            acl_entries=acl_entries,
-        ),
         "GatewayId": gateway_id,
     }
+    network_spec = _registry_network_spec(
+        network_type,
+        vpc_id=vpc_id,
+        subnet_id=subnet_id,
+        acl_entries=acl_entries,
+    )
+    if network_spec:
+        payload["NetworkSpec"] = network_spec
+    return payload
 
 
 def _registry_id_header_from_payload(payload: dict[str, Any]) -> dict[str, str] | None:
@@ -1542,7 +1651,7 @@ class UniRegistryClient:
             raise UniRegistryAPIError(f"request failed: {exc}") from exc
         if not response.ok:
             raise UniRegistryAPIError(
-                _format_api_error(response.status_code, response.text)
+                _format_api_error(response.status_code, response.text, response.headers)
             )
         if not response.content:
             return {}
@@ -1688,6 +1797,55 @@ class UniRegistryClient:
         return self.request(
             "POST",
             "/RetrySkillUniMigration",
+            {"Id": migration_id, "WorkspaceId": workspace_id, "Version": version},
+            headers=headers,
+        )
+
+    def start_mcp_uni_migration(
+        self,
+        resource_id: str,
+        top: dict[str, Any],
+        *,
+        workspace_id: str,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(resource_id) if with_id else None
+        return self.request(
+            "POST",
+            "/StartMCPUniMigration",
+            {"Id": resource_id, "WorkspaceId": workspace_id, **_top_payload(top)},
+            headers=headers,
+        )
+
+    def get_mcp_uni_migration(
+        self,
+        migration_id: str,
+        *,
+        workspace_id: str,
+        registry_id: str | None = None,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
+        return self.request(
+            "POST",
+            "/GetMCPUniMigration",
+            {"Id": migration_id, "WorkspaceId": workspace_id},
+            headers=headers,
+        )
+
+    def retry_mcp_uni_migration(
+        self,
+        migration_id: str,
+        *,
+        workspace_id: str,
+        version: int,
+        registry_id: str | None = None,
+        with_id: bool = False,
+    ) -> Any:
+        headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
+        return self.request(
+            "POST",
+            "/RetryMCPUniMigration",
             {"Id": migration_id, "WorkspaceId": workspace_id, "Version": version},
             headers=headers,
         )
@@ -2110,7 +2268,7 @@ def create_resource(
     network_type: list[str] | None = typer.Option(
         None,
         "--network-type",
-        help="Network type for NetworkSpec: PUBLIC or PRIVATE. Repeatable. Defaults to PUBLIC,PRIVATE.",
+        help="Network type for NetworkSpec: PUBLIC or PRIVATE. Repeatable.",
     ),
     vpc_id: str | None = typer.Option(
         None, "--vpc-id", help="VpcId required when PRIVATE network is enabled."
@@ -2123,12 +2281,12 @@ def create_resource(
     acl_entry: list[str] | None = typer.Option(
         None,
         "--acl-entry",
-        help="CIDR whitelist entry required when PUBLIC network is enabled. Repeatable.",
+        help="CIDR whitelist entry used to enable PUBLIC network. Repeatable.",
     ),
     acl_entries: str | None = typer.Option(
         None,
         "--acl-entries",
-        help="Comma-separated CIDR whitelist entries required when PUBLIC network is enabled.",
+        help="Comma-separated CIDR whitelist entries used to enable PUBLIC network.",
     ),
     monitor_spec: str | None = typer.Option(None, "--monitor-spec"),
     project_name: str | None = typer.Option(None, "--project-name"),
@@ -2271,7 +2429,7 @@ def syncer_resource(
     sync_type: str | None = typer.Option(
         None,
         "--type",
-        help="Migration type: a2a or skill. Defaults to both.",
+        help="Migration type: a2a, skill, or mcp. Defaults to all.",
     ),
     gateway_id: str | None = typer.Option(
         None,
@@ -2281,7 +2439,7 @@ def syncer_resource(
     network_type: list[str] | None = typer.Option(
         None,
         "--network-type",
-        help="Network type for created UniRegistry: PUBLIC or PRIVATE. Repeatable. Defaults to PUBLIC,PRIVATE.",
+        help="Network type for created UniRegistry: PUBLIC or PRIVATE. Repeatable.",
     ),
     vpc_id: str | None = typer.Option(
         None, "--vpc-id", help="VpcId required when PRIVATE network is enabled."
@@ -2307,7 +2465,7 @@ def syncer_resource(
     workspace_id: str | None = typer.Option(
         None,
         "--workspace-id",
-        help="Workspace ID required by Skill Uni migration APIs.",
+        help="Workspace ID required by Skill and MCP Uni migration APIs.",
     ),
     acl_entry: list[str] | None = typer.Option(
         None,
@@ -2327,13 +2485,16 @@ def syncer_resource(
 ) -> None:
     """Create or reuse a UniRegistry, then run migration syncers."""
     normalized_type = (sync_type or "").strip().lower()
-    if normalized_type and normalized_type not in {"a2a", "skill"}:
-        raise typer.BadParameter("--type must be a2a or skill")
+    if normalized_type and normalized_type not in {"a2a", "skill", "mcp"}:
+        raise typer.BadParameter("--type must be a2a, skill, or mcp")
     gateway_id = _resolve_gateway_id(gateway_id)
     run_a2a_syncer = normalized_type in {"", "a2a"}
     run_skill_syncer = normalized_type in {"", "skill"}
-    if run_skill_syncer and not workspace_id:
-        raise typer.BadParameter("--workspace-id is required for Skill migration")
+    run_mcp_syncer = normalized_type in {"", "mcp"}
+    if (run_skill_syncer or run_mcp_syncer) and not workspace_id:
+        raise typer.BadParameter(
+            "--workspace-id is required for Skill and MCP migration"
+        )
     resolved_acl_entries = _acl_entries(acl_entry, acl_entries)
 
     options = _options(ctx)
@@ -2382,6 +2543,7 @@ def syncer_resource(
         error_console.print(f"Set default UniRegistry id: {migration_registry_id}")
     migration_result = None
     skill_migration_result = None
+    mcp_migration_result = None
     if run_a2a_syncer:
         migration_result = _start_and_wait_uni_migration(
             client,
@@ -2406,6 +2568,19 @@ def syncer_resource(
             interval=wait_interval,
             deadline=deadline,
         )
+    if run_mcp_syncer:
+        mcp_migration_result = _start_and_wait_uni_migration(
+            client,
+            label="MCP Uni migration",
+            registry_id=migration_registry_id,
+            top=parsed_top,
+            start_migration=client.start_mcp_uni_migration,
+            wait_migration=_wait_for_mcp_uni_migration,
+            start_kwargs={"workspace_id": workspace_id},
+            wait_kwargs={"workspace_id": workspace_id},
+            interval=wait_interval,
+            deadline=deadline,
+        )
     _print(
         _registry_syncer_summary(
             registry_id=resource_id,
@@ -2415,6 +2590,7 @@ def syncer_resource(
             registry_response=final_response if created else None,
             migration_result=migration_result,
             skill_migration_result=skill_migration_result,
+            mcp_migration_result=mcp_migration_result,
         ),
         options["output"],
     )
@@ -2624,6 +2800,123 @@ def retry_skill_migration(
     resolved_registry_id = _resolve_registry_id(registry_id)
     resolved_migration_id = (migration_id or resolved_registry_id).strip()
     response = _client(options).retry_skill_uni_migration(
+        resolved_migration_id,
+        workspace_id=workspace_id,
+        version=version,
+        registry_id=resolved_registry_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response,
+            fallback_id=resolved_migration_id,
+            registry_id=resolved_registry_id,
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("start-mcp-migration")
+@_handle_api_errors
+def start_mcp_migration(
+    ctx: typer.Context,
+    resource_id: str | None = typer.Argument(
+        None,
+        help="UniRegistry ID. Defaults to uni_registry.defaults.registry_id.",
+    ),
+    top: str | None = typer.Option(None, "--top"),
+    workspace_id: str = typer.Option(
+        ...,
+        "--workspace-id",
+        help="Workspace ID required by MCP Uni migration APIs.",
+    ),
+) -> None:
+    """Start MCP Uni migration for a UniRegistry."""
+    options = _options(ctx)
+    resolved_resource_id = _resolve_registry_id(resource_id, source_label="RESOURCE_ID")
+    response = _client(options).start_mcp_uni_migration(
+        resolved_resource_id,
+        _json_object(top, "--top"),
+        workspace_id=workspace_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response, fallback_id=resolved_resource_id, registry_id=resolved_resource_id
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("get-mcp-migration")
+@_handle_api_errors
+def get_mcp_migration(
+    ctx: typer.Context,
+    migration_id: str | None = typer.Argument(
+        None,
+        help="MCP Uni migration ID. Defaults to the resolved UniRegistry ID when omitted.",
+    ),
+    registry_id: str | None = typer.Option(
+        None,
+        "--registry-id",
+        help="UniRegistry ID used for X-Mse-Uni-Registry-Id. Defaults to configured registry_id.",
+    ),
+    workspace_id: str = typer.Option(
+        ...,
+        "--workspace-id",
+        help="Workspace ID required by MCP Uni migration APIs.",
+    ),
+) -> None:
+    """Get MCP Uni migration status."""
+    options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
+    resolved_migration_id = (migration_id or resolved_registry_id).strip()
+    response = _client(options).get_mcp_uni_migration(
+        resolved_migration_id,
+        workspace_id=workspace_id,
+        registry_id=resolved_registry_id,
+        with_id=True,
+    )
+    _print(
+        _uni_migration_summary(
+            response,
+            fallback_id=resolved_migration_id,
+            registry_id=resolved_registry_id,
+        ),
+        options["output"],
+    )
+
+
+@registry_app.command("retry-mcp-migration")
+@_handle_api_errors
+def retry_mcp_migration(
+    ctx: typer.Context,
+    migration_id: str | None = typer.Argument(
+        None,
+        help="MCP Uni migration ID. Defaults to the resolved UniRegistry ID when omitted.",
+    ),
+    version: int = typer.Option(
+        ...,
+        "--version",
+        min=0,
+        help="Migration version.",
+    ),
+    registry_id: str | None = typer.Option(
+        None,
+        "--registry-id",
+        help="UniRegistry ID used for X-Mse-Uni-Registry-Id. Defaults to configured registry_id.",
+    ),
+    workspace_id: str = typer.Option(
+        ...,
+        "--workspace-id",
+        help="Workspace ID required by MCP Uni migration APIs.",
+    ),
+) -> None:
+    """Retry MCP Uni migration."""
+    options = _options(ctx)
+    resolved_registry_id = _resolve_registry_id(registry_id)
+    resolved_migration_id = (migration_id or resolved_registry_id).strip()
+    response = _client(options).retry_mcp_uni_migration(
         resolved_migration_id,
         workspace_id=workspace_id,
         version=version,

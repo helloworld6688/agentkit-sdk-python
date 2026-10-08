@@ -30,15 +30,48 @@ def isolated_uni_registry_config(monkeypatch):
 
 
 class _Response:
-    def __init__(self, payload: dict[str, object] | None = None, status_code: int = 200):
+    def __init__(
+        self,
+        payload: dict[str, object] | None = None,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ):
         self._payload = payload or {}
         self.status_code = status_code
         self.ok = 200 <= status_code < 300
         self.content = json.dumps(self._payload).encode()
         self.text = json.dumps(self._payload)
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
+
+
+def test_api_error_includes_request_id_from_response_header(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+
+    def request(method, url, **kwargs):
+        return _Response(
+            {"message": "permission denied"},
+            status_code=403,
+            headers={
+                "X-Request-Id": "req-from-header",
+                "X-Tt-Logid": "log-from-header",
+            },
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+
+    client = registry.UniRegistryClient(
+        "https://control.test", username="admin", password="secret"
+    )
+    with pytest.raises(registry.UniRegistryAPIError) as excinfo:
+        client.get_resource("ur-1", {})
+
+    message = str(excinfo.value)
+    assert "HTTP 403: permission denied" in message
+    assert "request_id=req-from-header" in message
+    assert "log_id=log-from-header" in message
 
 
 def test_record_create_resolves_private_address_from_registry_id(monkeypatch):
@@ -832,10 +865,27 @@ def test_resource_create_help_does_not_include_syncer_options():
     assert "--replicas" not in result.output
 
 
-def test_resource_create_defaults_to_public_private_and_requires_vpc_subnet():
+def test_resource_create_omits_network_spec_without_network_options(monkeypatch):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
 
-    missing_private_options = runner.invoke(
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return _Response({"Result": {"Id": "ur-1"}})
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
         app,
         [
             "uni-reg",
@@ -848,8 +898,13 @@ def test_resource_create_defaults_to_public_private_and_requires_vpc_subnet():
         ],
     )
 
-    assert missing_private_options.exit_code != 0
-    assert "--vpc-id is required" in missing_private_options.output
+    assert result.exit_code == 0, result.output
+    assert json.loads(calls[0][2]["data"]) == {
+        "Name": "uni-public-demo",
+        "Replicas": 2,
+        "GatewayId": "g-1",
+        "DeletionProtectionEnabled": True,
+    }
 
 
 def test_resource_create_requires_gateway_id():
@@ -1077,6 +1132,7 @@ def test_resource_syncer_requires_acl_entries_when_public_network_enabled(
     from agentkit.toolkit.cli.cli import app
 
     isolated_uni_registry_config.clear()
+
     monkeypatch.setattr(
         registry.UniRegistryClient,
         "_load_credentials",
@@ -1098,6 +1154,8 @@ def test_resource_syncer_requires_acl_entries_when_public_network_enabled(
             "g-1",
             "--network-type",
             "PUBLIC",
+            "--wait-interval",
+            "0.1",
         ],
     )
 
@@ -1246,7 +1304,7 @@ def test_resource_syncer_gateway_id_option_overrides_default(
     assert json.loads(calls[0][2]["data"])["GatewayId"] == "g-explicit"
 
 
-def test_resource_syncer_creates_when_no_default_and_runs_both(
+def test_resource_syncer_creates_when_no_default_and_runs_all(
     monkeypatch, isolated_uni_registry_config
 ):
     import agentkit.toolkit.cli.cli_uni_registry as registry
@@ -1303,6 +1361,12 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
             return _Response(
                 {"Result": {"Migration": {"Id": "mig-skill", "Status": "Succeeded"}}}
             )
+        if action == "StartMCPUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-mcp"}})
+        if action == "GetMCPUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-mcp", "Status": "Succeeded"}}}
+            )
         return _Response()
 
     monkeypatch.setattr(registry.requests, "request", request)
@@ -1345,6 +1409,8 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
         "GetA2aUniMigration",
         "StartSkillUniMigration",
         "GetSkillUniMigration",
+        "StartMCPUniMigration",
+        "GetMCPUniMigration",
     ]
     assert json.loads(calls[0][2]["data"]) == {
         "Name": "registry-abc123ef",
@@ -1364,6 +1430,10 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
         "Id": "ur-ready",
         "WorkspaceId": "ws-1",
     }
+    assert json.loads(calls[6][2]["data"]) == {
+        "Id": "ur-ready",
+        "WorkspaceId": "ws-1",
+    }
     output = json.loads(result.output[result.output.index("{") :])
     assert output["id"] == "ur-1"
     assert output["created"] is True
@@ -1379,10 +1449,122 @@ def test_resource_syncer_creates_when_no_default_and_runs_both(
     }
     assert output["a2a_syncer"]["id"] == "mig-a2a"
     assert output["skill_syncer"]["id"] == "mig-skill"
+    assert output["mcp_syncer"]["id"] == "mig-mcp"
     assert isolated_uni_registry_config["uni_registry"]["defaults"]["registry_id"] == "ur-ready"
 
 
-def test_resource_syncer_create_supports_private_network_options(monkeypatch):
+def test_resource_syncer_runs_mcp_with_workspace_id(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "gateway_id": "g-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "GetUniRegistry":
+            return _Response({"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}})
+        if action == "StartMCPUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-mcp"}})
+        if action == "GetMCPUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-mcp", "Status": "Succeeded"}}}
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "mcp",
+            "--workspace-id",
+            "ws-1",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [call[2]["params"]["Action"] for call in calls] == [
+        "GetUniRegistry",
+        "StartMCPUniMigration",
+        "GetMCPUniMigration",
+    ]
+    assert json.loads(calls[1][2]["data"]) == {
+        "Id": "ur-ready",
+        "WorkspaceId": "ws-1",
+    }
+    output = json.loads(result.output[result.output.index("{") :])
+    assert "a2a_syncer" not in output
+    assert "skill_syncer" not in output
+    assert output["mcp_syncer"]["id"] == "mig-mcp"
+
+
+def test_resource_syncer_requires_workspace_id_for_mcp(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "gateway_id": "g-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(app, ["uni-reg", "registry", "syncer", "--type", "mcp"])
+
+    assert result.exit_code != 0
+    assert "--workspace-id is required" in result.output
+
+
+def test_resource_syncer_creates_private_network_when_vpc_subnet_are_provided(
+    monkeypatch,
+):
     import agentkit.toolkit.cli.cli_uni_registry as registry
     from agentkit.toolkit.cli.cli import app
 
@@ -1426,8 +1608,6 @@ def test_resource_syncer_create_supports_private_network_options(monkeypatch):
             "a2a",
             "--gateway-id",
             "g-1",
-            "--network-type",
-            "PRIVATE",
             "--vpc-id",
             "vpc-xxx",
             "--subnet-id",
@@ -1451,7 +1631,7 @@ def test_resource_syncer_create_supports_private_network_options(monkeypatch):
     }
 
 
-def test_resource_syncer_defaults_to_public_private_and_requires_vpc_subnet(
+def test_resource_syncer_omits_network_spec_without_network_options(
     monkeypatch, isolated_uni_registry_config
 ):
     import agentkit.toolkit.cli.cli_uni_registry as registry
@@ -1459,6 +1639,27 @@ def test_resource_syncer_defaults_to_public_private_and_requires_vpc_subnet(
 
     isolated_uni_registry_config.clear()
 
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "CreateUniRegistry":
+            return _Response({"Result": {"Id": "ur-1"}})
+        if action == "GetUniRegistry":
+            return _Response(
+                {"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}}
+            )
+        if action == "StartA2aUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-a2a"}})
+        if action == "GetA2aUniMigration":
+            return _Response(
+                {"Result": {"Migration": {"Id": "mig-a2a", "Status": "Succeeded"}}}
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(registry.secrets, "token_hex", lambda _size: "abc123ef")
     monkeypatch.setattr(
         registry.UniRegistryClient,
         "_load_credentials",
@@ -1478,11 +1679,13 @@ def test_resource_syncer_defaults_to_public_private_and_requires_vpc_subnet(
             "a2a",
             "--gateway-id",
             "g-1",
+            "--wait-interval",
+            "0.1",
         ],
     )
 
-    assert result.exit_code != 0
-    assert "--vpc-id is required" in result.output
+    assert result.exit_code == 0, result.output
+    assert "NetworkSpec" not in json.loads(calls[0][2]["data"])
 
 
 def test_resource_syncer_requires_gateway_id(
@@ -1792,6 +1995,109 @@ def test_resource_skill_migration_commands_use_registry_id_header(
     assert output["status"] == "Succeeded"
 
 
+def test_resource_mcp_migration_commands_use_workspace_and_registry_header(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "StartMCPUniMigration":
+            return _Response(
+                {
+                    "ResponseMetadata": {"RequestId": "req-start-mcp"},
+                    "Result": {"MigrationId": "mig-mcp", "Status": "Running"},
+                }
+            )
+        return _Response(
+            {
+                "ResponseMetadata": {"RequestId": "req-get-mcp"},
+                "Result": {
+                    "Migration": {
+                        "Id": "mig-mcp",
+                        "Status": "Succeeded",
+                        "Progress": 100,
+                    }
+                },
+            }
+        )
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "start-mcp-migration",
+            "--workspace-id",
+            "ws-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "StartMCPUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {
+        "Id": "ur-default",
+        "WorkspaceId": "ws-1",
+    }
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
+    output = json.loads(result.output)
+    assert output["id"] == "mig-mcp"
+    assert output["registry_id"] == "ur-default"
+
+    calls.clear()
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "get-mcp-migration",
+            "mig-mcp",
+            "--registry-id",
+            "ur-explicit",
+            "--workspace-id",
+            "ws-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "GetMCPUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {
+        "Id": "mig-mcp",
+        "WorkspaceId": "ws-1",
+    }
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-explicit"
+    output = json.loads(result.output)
+    assert output["id"] == "mig-mcp"
+    assert output["registry_id"] == "ur-explicit"
+    assert output["status"] == "Succeeded"
+
+
 def test_resource_retry_migration_commands_include_version_and_workspace(
     monkeypatch, isolated_uni_registry_config
 ):
@@ -1872,6 +2178,30 @@ def test_resource_retry_migration_commands_include_version_and_workspace(
         "Id": "mig-skill",
         "WorkspaceId": "ws-1",
         "Version": 8,
+    }
+    assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
+
+    calls.clear()
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "retry-mcp-migration",
+            "mig-mcp",
+            "--version",
+            "9",
+            "--workspace-id",
+            "ws-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][2]["params"]["Action"] == "RetryMCPUniMigration"
+    assert json.loads(calls[0][2]["data"]) == {
+        "Id": "mig-mcp",
+        "WorkspaceId": "ws-1",
+        "Version": 9,
     }
     assert calls[0][2]["headers"]["X-Mse-Uni-Registry-Id"] == "ur-default"
 

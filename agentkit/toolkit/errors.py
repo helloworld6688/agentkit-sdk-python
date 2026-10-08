@@ -143,9 +143,18 @@ class ApiError(AgentKitError):
     (distinct from the :class:`ErrorCode` enum used by the other domain errors).
     """
 
-    def __init__(self, message: str, *, error_code: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        action: str | None = None,
+    ):
         super().__init__(message)
         self.error_code = error_code
+        self.request_id = request_id
+        self.action = action
 
 
 __all__ = [
