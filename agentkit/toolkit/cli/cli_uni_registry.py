@@ -881,7 +881,7 @@ def _migration_from_response(response: Any) -> dict[str, Any] | None:
         "a2a_uni_migration",
         "A2aUniMigration",
         "mcp_uni_migration",
-        "MCPUniMigration",
+        "McpUniMigration",
         "task",
         "Task",
     ):
@@ -935,6 +935,7 @@ def _is_migration_failed_status(status: str | None) -> bool:
         "canceled",
         "cancelled",
         "terminated",
+        "completed_with_errors",
     }
 
 
@@ -1176,7 +1177,7 @@ def _wait_for_mcp_uni_migration(
     return _wait_for_uni_migration(
         migration_id,
         label="MCP Uni migration",
-        response_key="GetMCPUniMigrationResponse",
+        response_key="GetMcpUniMigrationResponse",
         get_migration=client.get_mcp_uni_migration,
         registry_id=registry_id,
         with_id=with_id,
@@ -1812,7 +1813,7 @@ class UniRegistryClient:
         headers = _uni_registry_id_header(resource_id) if with_id else None
         return self.request(
             "POST",
-            "/StartMCPUniMigration",
+            "/StartMcpUniMigration",
             {"Id": resource_id, "WorkspaceId": workspace_id, **_top_payload(top)},
             headers=headers,
         )
@@ -1828,7 +1829,7 @@ class UniRegistryClient:
         headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
         return self.request(
             "POST",
-            "/GetMCPUniMigration",
+            "/GetMcpUniMigration",
             {"Id": migration_id, "WorkspaceId": workspace_id},
             headers=headers,
         )
@@ -1845,7 +1846,7 @@ class UniRegistryClient:
         headers = _uni_registry_id_header(registry_id) if with_id and registry_id else None
         return self.request(
             "POST",
-            "/RetryMCPUniMigration",
+            "/RetryMcpUniMigration",
             {"Id": migration_id, "WorkspaceId": workspace_id, "Version": version},
             headers=headers,
         )

@@ -1361,9 +1361,9 @@ def test_resource_syncer_creates_when_no_default_and_runs_all(
             return _Response(
                 {"Result": {"Migration": {"Id": "mig-skill", "Status": "Succeeded"}}}
             )
-        if action == "StartMCPUniMigration":
+        if action == "StartMcpUniMigration":
             return _Response({"Result": {"MigrationId": "mig-mcp"}})
-        if action == "GetMCPUniMigration":
+        if action == "GetMcpUniMigration":
             return _Response(
                 {"Result": {"Migration": {"Id": "mig-mcp", "Status": "Succeeded"}}}
             )
@@ -1409,8 +1409,8 @@ def test_resource_syncer_creates_when_no_default_and_runs_all(
         "GetA2aUniMigration",
         "StartSkillUniMigration",
         "GetSkillUniMigration",
-        "StartMCPUniMigration",
-        "GetMCPUniMigration",
+        "StartMcpUniMigration",
+        "GetMcpUniMigration",
     ]
     assert json.loads(calls[0][2]["data"]) == {
         "Name": "registry-abc123ef",
@@ -1479,9 +1479,9 @@ def test_resource_syncer_runs_mcp_with_workspace_id(
         action = kwargs.get("params", {}).get("Action")
         if action == "GetUniRegistry":
             return _Response({"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}})
-        if action == "StartMCPUniMigration":
+        if action == "StartMcpUniMigration":
             return _Response({"Result": {"MigrationId": "mig-mcp"}})
-        if action == "GetMCPUniMigration":
+        if action == "GetMcpUniMigration":
             return _Response(
                 {"Result": {"Migration": {"Id": "mig-mcp", "Status": "Succeeded"}}}
             )
@@ -1515,8 +1515,8 @@ def test_resource_syncer_runs_mcp_with_workspace_id(
     assert result.exit_code == 0, result.output
     assert [call[2]["params"]["Action"] for call in calls] == [
         "GetUniRegistry",
-        "StartMCPUniMigration",
-        "GetMCPUniMigration",
+        "StartMcpUniMigration",
+        "GetMcpUniMigration",
     ]
     assert json.loads(calls[1][2]["data"]) == {
         "Id": "ur-ready",
@@ -1526,6 +1526,86 @@ def test_resource_syncer_runs_mcp_with_workspace_id(
     assert "a2a_syncer" not in output
     assert "skill_syncer" not in output
     assert output["mcp_syncer"]["id"] == "mig-mcp"
+
+
+def test_resource_syncer_stops_polling_mcp_completed_with_errors(
+    monkeypatch, isolated_uni_registry_config
+):
+    import agentkit.toolkit.cli.cli_uni_registry as registry
+    from agentkit.toolkit.cli.cli import app
+
+    isolated_uni_registry_config.update(
+        {
+            "uni_registry": {
+                "defaults": {
+                    "registry_id": "ur-default",
+                    "gateway_id": "g-default",
+                    "server": "https://open.volcengineapi.com",
+                    "region": "cn-beijing",
+                    "service": "agentkit_stg",
+                }
+            }
+        }
+    )
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        action = kwargs.get("params", {}).get("Action")
+        if action == "GetUniRegistry":
+            return _Response({"Result": {"Registry": {"Id": "ur-ready", "Status": "Running"}}})
+        if action == "StartMcpUniMigration":
+            return _Response({"Result": {"MigrationId": "mig-mcp"}})
+        if action == "GetMcpUniMigration":
+            return _Response(
+                {
+                    "Result": {
+                        "Migration": {
+                            "Id": "mig-mcp",
+                            "Status": "COMPLETED_WITH_ERRORS",
+                            "Message": "some items failed",
+                        }
+                    }
+                }
+            )
+        return _Response()
+
+    monkeypatch.setattr(registry.requests, "request", request)
+    monkeypatch.setattr(
+        registry.UniRegistryClient,
+        "_load_credentials",
+        lambda self: (
+            setattr(self, "access_key", "ak"),
+            setattr(self, "secret_key", "sk"),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uni-reg",
+            "registry",
+            "syncer",
+            "--type",
+            "mcp",
+            "--workspace-id",
+            "ws-1",
+            "--wait-interval",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [call[2]["params"]["Action"] for call in calls] == [
+        "GetUniRegistry",
+        "StartMcpUniMigration",
+        "GetMcpUniMigration",
+    ]
+    output = json.loads(result.output[result.output.index("{") :])
+    assert output["mcp_syncer"]["status"] == "COMPLETED_WITH_ERRORS"
+    assert output["mcp_syncer"]["ready"] is False
+    assert output["mcp_syncer"]["timed_out"] is False
+    assert output["mcp_syncer"]["message"] == "some items failed"
 
 
 def test_resource_syncer_requires_workspace_id_for_mcp(
@@ -2018,7 +2098,7 @@ def test_resource_mcp_migration_commands_use_workspace_and_registry_header(
     def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
         action = kwargs.get("params", {}).get("Action")
-        if action == "StartMCPUniMigration":
+        if action == "StartMcpUniMigration":
             return _Response(
                 {
                     "ResponseMetadata": {"RequestId": "req-start-mcp"},
@@ -2060,7 +2140,7 @@ def test_resource_mcp_migration_commands_use_workspace_and_registry_header(
     )
 
     assert result.exit_code == 0, result.output
-    assert calls[0][2]["params"]["Action"] == "StartMCPUniMigration"
+    assert calls[0][2]["params"]["Action"] == "StartMcpUniMigration"
     assert json.loads(calls[0][2]["data"]) == {
         "Id": "ur-default",
         "WorkspaceId": "ws-1",
@@ -2086,7 +2166,7 @@ def test_resource_mcp_migration_commands_use_workspace_and_registry_header(
     )
 
     assert result.exit_code == 0, result.output
-    assert calls[0][2]["params"]["Action"] == "GetMCPUniMigration"
+    assert calls[0][2]["params"]["Action"] == "GetMcpUniMigration"
     assert json.loads(calls[0][2]["data"]) == {
         "Id": "mig-mcp",
         "WorkspaceId": "ws-1",
@@ -2197,7 +2277,7 @@ def test_resource_retry_migration_commands_include_version_and_workspace(
     )
 
     assert result.exit_code == 0, result.output
-    assert calls[0][2]["params"]["Action"] == "RetryMCPUniMigration"
+    assert calls[0][2]["params"]["Action"] == "RetryMcpUniMigration"
     assert json.loads(calls[0][2]["data"]) == {
         "Id": "mig-mcp",
         "WorkspaceId": "ws-1",
